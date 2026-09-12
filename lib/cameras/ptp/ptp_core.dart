@@ -28,8 +28,16 @@ class Ptp {
   /// 尼康大缩略图（更清晰，AeroShutter 同策略：先大图后标准图）
   static const opNikonGetLargeThumb = 0x90C4;
 
+  /// 尼康事件检查（remoteyourcam/libgphoto2 同款）：
+  /// 普通 PTP 事务返回事件数组，USB 上替代 interrupt 端点
+  static const opNikonGetEvent = 0x90C1;
+
   // ---------- 常用响应码 ----------
   static const rcOK = 0x2001;
+
+  /// 会话已打开：上次连接异常退出（ANR/被杀）没 CloseSession 时，
+  /// 相机会保留会话，本次 OpenSession 返回此码——视为成功直接沿用
+  static const rcSessionAlreadyOpen = 0x201E;
 
   // ---------- 对象格式 ----------
   static const ofcAssociation = 0x3001;

@@ -22,19 +22,46 @@ class PtpSession {
     List<int> params, {
     List<int> sendData = const [],
     Duration timeout = const Duration(seconds: 30),
-  }) => _link.transact(code, params, sendData: sendData, timeout: timeout);
+    void Function(int received)? onData,
+  }) => _link.transact(
+    code,
+    params,
+    sendData: sendData,
+    timeout: timeout,
+    onData: onData,
+  );
 
-  /// OpenSession（session id 固定 1）
+  /// OpenSession（session id 固定 1）。
+  /// 上次连接异常退出（ANR/被杀）时相机会保留脏会话并返回
+  /// SessionAlreadyOpen(0x201E)——此时不能直接沿用（旧状态会挂起后续
+  /// 事务），必须 CloseSession 后重新 OpenSession 拿一个干净会话。
   Future<void> openSession() async {
     if (_open) return;
-    await transact(Ptp.opOpenSession, [1]);
-    _open = true;
+    try {
+      await transact(Ptp.opOpenSession, [1]);
+      _open = true;
+    } on PtpException catch (e) {
+      if (e.code == Ptp.rcSessionAlreadyOpen) {
+        try {
+          await transact(Ptp.opCloseSession, const []);
+        } catch (_) {}
+        await transact(Ptp.opOpenSession, [1]);
+        _open = true;
+        return;
+      }
+      rethrow;
+    }
   }
 
   Future<void> closeSession() async {
     if (!_open) return;
     try {
-      await transact(Ptp.opCloseSession, []);
+      // 链路可能已死（设备拔出）：3s 收不了就算了，别拖住断开流程
+      await transact(
+        Ptp.opCloseSession,
+        [],
+      ).timeout(const Duration(seconds: 3));
+    } catch (_) {
     } finally {
       _open = false;
     }
@@ -73,6 +100,25 @@ class PtpSession {
     return Ptp.parseU32Array(Uint8List.fromList(data), 0);
   }
 
+  /// 尼康厂商事件检查（0x90C1）：USB 上替代 interrupt 端点的事件来源。
+  /// 数据格式：[count u16][eventCode u16][param u32] × count
+  Future<List<PtpEvent>> getNikonEvents() async {
+    final data = await transact(Ptp.opNikonGetEvent, []);
+    final events = <PtpEvent>[];
+    if (data.length < 2) return events;
+    final bytes = Uint8List.fromList(data);
+    final b = ByteData.sublistView(bytes);
+    final count = b.getUint16(0, Endian.little);
+    var off = 2;
+    for (var i = 0; i < count && off + 6 <= bytes.length; i++) {
+      final code = b.getUint16(off, Endian.little);
+      final param = b.getUint32(off + 2, Endian.little);
+      off += 6;
+      events.add(PtpEvent(eventCode: code, params: [param]));
+    }
+    return events;
+  }
+
   Future<PtpObjectInfo> getObjectInfo(int handle) async {
     final data = await transact(Ptp.opGetObjectInfo, [handle]);
     return PtpObjectInfo.parse(Uint8List.fromList(data));
@@ -90,40 +136,45 @@ class PtpSession {
       onProgress?.call(0);
       return Stream.value(const []);
     }
-    return _chunkedStream(handle, totalSize, chunk, onProgress);
+    return _chunkedStream(handle, totalSize, onProgress);
   }
 
   Stream<List<int>> _chunkedStream(
     int handle,
     int totalSize,
-    int chunk,
     void Function(int)? onProgress,
   ) async* {
     var offset = 0;
     var received = 0;
-    var first = true;
+    // 分块上限 64KB：Z6 实测对 1MiB 的 GetPartialObject 会挂起并随后
+    // 自我复位掉线（相机 USB 固件限制），64KB 稳定。64KB 粒度同时也
+    // 是进度刷新颗粒度。
+    const chunk = 65536;
     while (offset < totalSize) {
       final want = (totalSize - offset) < chunk ? (totalSize - offset) : chunk;
       List<int> data;
       try {
-        data = await transact(Ptp.opGetPartialObject, [
-          handle,
-          offset,
-          want,
-        ], timeout: const Duration(minutes: 10));
+        data = await transact(
+          Ptp.opGetPartialObject,
+          [handle, offset, want],
+          timeout: const Duration(minutes: 10),
+          onData: (n) => onProgress?.call(received + n),
+        );
       } on PtpException catch (e) {
-        // 首块即失败 → 机型不支持分块，回退 GetObject 整体传输
-        if (first && e.code != null && e.code != Ptp.rcOK && offset == 0) {
-          final full = await transact(Ptp.opGetObject, [
-            handle,
-          ], timeout: const Duration(minutes: 10));
+        // 明确报错（非超时挂起）→ 机型不支持分块，回退 GetObject 整体传输
+        if (offset == 0 && e.code != null && e.code != Ptp.rcOK) {
+          final full = await transact(
+            Ptp.opGetObject,
+            [handle],
+            timeout: const Duration(minutes: 10),
+            onData: (n) => onProgress?.call(n),
+          );
           onProgress?.call(full.length);
           yield full;
           return;
         }
         rethrow;
       }
-      first = false;
       offset += data.length;
       received += data.length;
       onProgress?.call(received);
@@ -172,11 +223,9 @@ class PtpSession {
   /// StorageInfo: [storageType u16][fs u16][access u16][max u64][free u64]...
   Future<int?> storageFreeBytes({int storageId = 0x00010001}) async {
     try {
-      final data = await transact(
-        Ptp.opGetStorageInfo,
-        [storageId],
-        timeout: const Duration(seconds: 5),
-      );
+      final data = await transact(Ptp.opGetStorageInfo, [
+        storageId,
+      ], timeout: const Duration(seconds: 5));
       if (data.length < 22) return null;
       final b = ByteData.sublistView(Uint8List.fromList(data));
       return b.getUint64(14, Endian.little);

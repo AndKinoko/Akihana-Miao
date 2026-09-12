@@ -43,6 +43,15 @@ class CameraHub extends ChangeNotifier {
   /// 当前连接品牌（信息卡/调试用；未连接为 null）
   String? get activeBrand => _activeDriver?.brand;
 
+  /// 最近一次拉取失败的原因（诊断用）
+  String? lastPullError;
+
+  /// 轮询连续失败计数（设备掉线感知）
+  int _pollFailCount = 0;
+
+  /// 最近一次 USB 发现的相机描述（型号兜底用）
+  String? _lastCamLabel;
+
   // 连接阶段状态机（浮层展示；success 展示后自动归 idle）
   ConnectPhase phase = ConnectPhase.idle;
   String phaseDetail = '';
@@ -52,6 +61,19 @@ class CameraHub extends ChangeNotifier {
 
   /// 一次性断开提示（UI 弹一次即清，避免重复弹）
   String? disconnectNote;
+
+  /// 一次性批量拉取结果提示（传输页跳转后由相机页弹一次即清）
+  String? pullNote;
+
+  void setPullNote(String note) {
+    pullNote = note;
+    notifyListeners();
+  }
+
+  /// 自动拉取待办队列（连拍场景：先全部登记「排队中」，再串行消费，
+  /// 保证传输-拉取面板能看到完整队列，而不是一个拉完才出现下一个）
+  final List<({int handle, PullJob job, PtpObjectInfo info})> _autoQueue = [];
+  bool _autoDraining = false;
 
   // 缩略图：相机缓存 + Future 去重 + 本地回填
   final Map<int, Uint8List> thumbs = {};
@@ -115,20 +137,31 @@ class CameraHub extends ChangeNotifier {
         final p = AppConfig.instance.brandPreference;
         _fail(
           p == AppConfig.brandAuto
-              ? '未发现 USB 相机\n请确认数据线已连接，相机 USB 模式设为 PTP/MTP'
+              ? '未发现 USB 相机\n请确认：① 数据线支持数据传输（OTG）'
+                    '② 相机已开机 ③ 手机支持 OTG'
               : '未发现${_brandLabel(p)} USB 相机\n若品牌选择有误，请在连接方式上方改为「自动」',
         );
         return;
       }
       final cam = cams.first;
       final driver = CameraDrivers.byBrand(cam.brand);
+      _lastCamLabel = cam.label;
       connKind = 'usb';
       connHost = null;
       _lastKind = 'usb';
       _setPhase(ConnectPhase.handshaking, 'PTP 握手中…');
       await _finishConnect(() => driver.connectUsb(cam.id), driver);
     } catch (e) {
-      if (!_cancelled) _fail('连接失败：$e');
+      if (!_cancelled) {
+        final msg = e.toString();
+        // 读取超时最常见的原因是相机被其他应用占用
+        // （接入时的系统选择框选了别的 App，或相册/文件管理器正在浏览相机）
+        final hint = msg.contains('超时') || msg.contains('bulkRead')
+            ? '$e\n排查：接入相机时系统弹框请选择 Akihana；'
+                  '关闭正在浏览相机的其他应用；或相机关机重开后再试'
+            : '连接失败：$e';
+        _fail(hint);
+      }
     } finally {
       busy = false;
       notifyListeners();
@@ -233,11 +266,21 @@ class CameraHub extends ChangeNotifier {
         } catch (_) {}
         return;
       }
-      // 真实型号：GetDeviceInfo 优先，握手友好名兜底（失败降级为「相机」）
+      // 真实型号：GetDeviceInfo 优先，USB 发现描述兜底，最后降级为「相机」
+      var m = '';
       try {
-        final m = await s.model();
-        if (m.isNotEmpty) deviceModel = m;
+        m = await s.model();
       } catch (_) {}
+      if (m.isEmpty) {
+        // USB 发现时的系统描述，如 "USB · NIKON DSC Z 6 (04b0:1091)"
+        m =
+            RegExp(
+              r'USB · ([^(]+)',
+            ).firstMatch(_lastCamLabel ?? '')?.group(1)?.trim() ??
+            '';
+      }
+      debugPrint('相机型号: "$m"');
+      if (m.isNotEmpty) deviceModel = m;
       _sortRows(rows);
       session = s;
       objects = rows;
@@ -249,6 +292,10 @@ class CameraHub extends ChangeNotifier {
       autoCount = 0;
       autoBytes = 0;
       _setPhase(ConnectPhase.success, '${rows.length} 个对象');
+      debugPrint(
+        '连接成功: brand=$_activeDriver? model=$deviceModel '
+        '对象=${rows.length} kind=$connKind host=$connHost',
+      );
       s.markKnown(handles);
       await _loadPulledNames();
       _readDeviceStatus();
@@ -280,6 +327,7 @@ class CameraHub extends ChangeNotifier {
   }
 
   void _fail(String reason) {
+    debugPrint('连接失败: $reason');
     phase = ConnectPhase.failed;
     failReason = reason;
     notifyListeners();
@@ -365,28 +413,78 @@ class CameraHub extends ChangeNotifier {
 
   void _startKeepAlive() {
     _keepAlive?.cancel();
-    // WiFi 空闲时相机可能断开；定期 GetStorageIDs 保活（AeroShutter 同策略）
+    // WiFi 空闲时相机可能断开；定期 GetStorageIDs 保活（AeroShutter 同策略）。
+    // busy/batchRunning 门禁：下载进行中绝不插队发事务——USB 是共享 bulk 数据流，
+    // 数据阶段中途收到新命令会让相机复位掉线（Z6 实测「接入约 25~30s 必死」）；
+    // 下载本身就是最好的保活，无需额外心跳。
     _keepAlive = Timer.periodic(const Duration(seconds: 25), (_) async {
+      if (busy || batchRunning) return;
       try {
         await session?.getStorageIds();
       } catch (_) {}
     });
   }
 
-  /// 轮询拉新图：不保证推 ObjectAdded 事件的机型（索尼等）用句柄差集兜底。
-  /// 周期由品牌驱动给出；拉图/批量进行中跳过一轮，避免抢串行队列。
+  /// 链路死亡/断开统一清理：自动拉取待办与拉取面板任务全部作废，
+  /// 避免残留死任务一直显示「排队中/拉取中」
+  void _clearPullQueues() {
+    _autoQueue.clear();
+    PullManager.instance.clearAll();
+  }
+
+  /// 轮询拉新图：不保证推 ObjectAdded 事件的机型（索尼等）用句柄差集兜底，
+  /// 尼康 USB 用厂商事件检查命令。拉图/批量进行中跳过一轮，避免抢串行队列。
   void _startPolling(CameraDriver driver) {
     _pollTimer?.cancel();
     _activeDriver = driver;
-    if (driver.newFileStrategy != NewFileStrategy.pollHandles) return;
-    _pollTimer = Timer.periodic(driver.pollInterval, (_) => _pollNewObjects());
+    if (driver.newFileStrategy == NewFileStrategy.eventPush) return;
+    _pollTimer = Timer.periodic(driver.pollInterval, (_) {
+      if (driver.newFileStrategy == NewFileStrategy.eventPoll) {
+        _pollNikonEvents();
+      } else {
+        _pollNewObjects();
+      }
+    });
   }
 
+  /// 尼康事件轮询：0x90C1 返回 ObjectAdded/ObjectRemoved 等事件数组，
+  /// 与 interrupt 事件同管线处理。USB 上不再有并发端点请求。
+  Future<void> _pollNikonEvents() async {
+    final s = session;
+    if (s == null || busy || batchRunning || _cancelled) return;
+    try {
+      final events = await s.getNikonEvents();
+      if (session != s || events.isEmpty) return;
+      var changed = false;
+      for (final ev in events) {
+        final handle = ev.params.isEmpty ? null : ev.params.first;
+        if (handle == null) continue;
+        if (ev.eventCode == PtpEvent.objectRemoved) {
+          objects.removeWhere((r) => r.handle == handle);
+          thumbs.remove(handle);
+          selectedHandles.remove(handle);
+          changed = true;
+        } else if (ev.eventCode == PtpEvent.objectAdded) {
+          final before = objects.length;
+          await _processNewHandle(s, handle);
+          if (objects.length != before) changed = true;
+        }
+      }
+      if (changed) notifyListeners();
+    } catch (_) {
+      /* 单轮失败忽略（链路死亡由事件流 onDone 兜底） */
+    }
+  }
+
+  /// 句柄差集轮询（索尼等 pollHandles 策略；尼康 USB 暂用同款）。
+  /// 连续失败 3 次 = 设备已从总线消失，标记链路死亡提示重连
+  /// （USB 上没有事件流 onDone，掉线只能靠轮询失败感知）。
   Future<void> _pollNewObjects() async {
     final s = session;
     if (s == null || busy || batchRunning || _cancelled) return;
     try {
       final handles = await s.listObjectHandles();
+      _pollFailCount = 0;
       if (session != s) return; // 会话已切换
       final handleSet = handles.toSet();
       // 同步删除：SD 卡上已移除的文件从网格消失（对齐 ObjectRemoved 语义）
@@ -395,7 +493,7 @@ class CameraHub extends ChangeNotifier {
           .map((r) => r.handle)
           .toList();
       if (removed.isNotEmpty) {
-        objects.removeWhere((r) => handleSet.contains(r.handle) == false);
+        objects.removeWhere((r) => !handleSet.contains(r.handle));
         for (final h in removed) {
           thumbs.remove(h);
           selectedHandles.remove(h);
@@ -409,8 +507,27 @@ class CameraHub extends ChangeNotifier {
           await _processNewHandle(s, h);
         }
       }
-    } catch (_) {
-      /* 单轮轮询失败忽略（链路死亡由事件流 onDone 兜底） */
+    } catch (e) {
+      _pollFailCount++;
+      debugPrint('轮询失败 x$_pollFailCount: $e');
+      if (_pollFailCount >= 3) {
+        _eventSub?.cancel();
+        _keepAlive?.cancel();
+        _pollTimer?.cancel();
+        _pollFailCount = 0;
+        final dead = session;
+        session = null;
+        _activeDriver = null;
+        _clearPullQueues();
+        disconnectNote = '相机无响应，连接已断开，请重新连接';
+        if (dead != null) {
+          unawaited(
+            dead.close().catchError((Object e) => debugPrint('关闭会话异常: $e')),
+          );
+        }
+        notifyListeners();
+        KeepAliveSync.sync();
+      }
     }
   }
 
@@ -426,6 +543,7 @@ class CameraHub extends ChangeNotifier {
         _keepAlive?.cancel();
         _pollTimer?.cancel();
         session = null;
+        _clearPullQueues();
         disconnectNote = '连接已断开，请重新连接';
         notifyListeners();
         KeepAliveSync.sync(); // 链路死亡：若无上传任务则停保活
@@ -471,22 +589,15 @@ class CameraHub extends ChangeNotifier {
           : '';
       final type = AppConfig.extToPullType(ext);
       if (!AppConfig.instance.pullTypes.contains(type)) return;
-      await pullObject(handle, info, auto: true);
+      _enqueueAutoPull(handle, info);
     } catch (_) {
       /* 事件到达时对象可能还没就绪，忽略 */
     }
   }
 
-  // ---------- 拉取 ----------
-
-  /// 拉取单个对象（自动拉取走这里；手动只有批量入口）。
-  Future<void> pullObject(
-    int handle,
-    PtpObjectInfo info, {
-    bool auto = false,
-  }) async {
-    final s = session;
-    if (s == null) return;
+  /// 自动拉取登记：先入队显示「排队中」，再由 drain 串行消费。
+  /// 连拍时多张新图一次性全部可见，而不是拉完一张才冒出下一张。
+  void _enqueueAutoPull(int handle, PtpObjectInfo info) {
     if (pulledNames.contains(info.filename)) return;
     if (PullManager.instance.hasActive(info.filename)) return;
     final job = PullManager.instance.begin(
@@ -494,21 +605,50 @@ class CameraHub extends ChangeNotifier {
       info.size,
       thumbs[handle],
       isRaw: info.isRaw,
+      queued: true,
     );
-    busy = true;
+    _autoQueue.add((handle: handle, job: job, info: info));
     notifyListeners();
+    unawaited(_drainAutoQueue());
+  }
+
+  Future<void> _drainAutoQueue() async {
+    if (_autoDraining) return;
+    _autoDraining = true;
     try {
-      await _downloadJob(s, job, handle, info);
-      if (auto) {
-        // 本次自动拉取统计（仅成功的自动拉取计数）
-        autoCount++;
-        autoBytes += info.size;
+      while (_autoQueue.isNotEmpty) {
+        final s = session;
+        if (s == null) {
+          // 会话没了：清掉剩余排队任务（断开路径也会清，这里防并发窗口）
+          for (final t in _autoQueue) {
+            PullManager.instance.fail(t.job, '连接已断开');
+          }
+          _autoQueue.clear();
+          return;
+        }
+        if (batchRunning) return; // 批量优先，batchPull 结束后会继续消费
+        final t = _autoQueue.removeAt(0);
+        if (!PullManager.instance.jobs.contains(t.job)) continue;
+        PullManager.instance.start(t.job);
+        busy = true;
+        notifyListeners();
+        try {
+          await _downloadJob(s, t.job, t.handle, t.info);
+          autoCount++;
+          autoBytes += t.info.size;
+        } catch (e) {
+          debugPrint('自动拉取失败 ${t.info.filename}: $e');
+        } finally {
+          busy = false;
+          notifyListeners();
+        }
       }
     } finally {
-      busy = false;
-      notifyListeners();
+      _autoDraining = false;
     }
   }
+
+  // ---------- 拉取 ----------
 
   /// 批量拉取：任务先全部入队（排队中），再逐个拉取。
   /// [handles] 允许为空集合 → 什么都不做。手动拉取不受类型过滤约束。
@@ -539,6 +679,7 @@ class CameraHub extends ChangeNotifier {
     }
     notifyListeners();
     var okCount = 0;
+    final errors = <String>[];
     for (final (s, job, handle, info) in queue) {
       // 连接死亡后剩余任务不再逐个尝试
       if (session == null || s != session) break;
@@ -546,11 +687,16 @@ class CameraHub extends ChangeNotifier {
       try {
         await _downloadJob(s, job, handle, info);
         okCount++;
-      } catch (_) {}
+      } catch (e) {
+        errors.add('${info.filename}: $e');
+      }
     }
     batchRunning = false;
     busy = false;
+    lastPullError = errors.isEmpty ? null : errors.first;
     notifyListeners();
+    // 批量期间挂起的自动拉取继续消费
+    unawaited(_drainAutoQueue());
     return okCount;
   }
 
@@ -617,12 +763,33 @@ class CameraHub extends ChangeNotifier {
       LocalLibrary.instance.notifyChanged();
       PullManager.instance.finish(job);
     } catch (e) {
+      debugPrint('拉取失败 ${info.filename}: $e');
       // 清理下载失败的半成品文件（避免 0 字节残留）
       try {
         final t = target;
         if (t != null && t.existsSync()) t.deleteSync();
       } catch (_) {}
       PullManager.instance.fail(job, e.toString());
+      // 读超时 = 相机不响应（如 GetPartialObject 挂起）：链路标记死亡，
+      // 提示重连——与事件流 onDone 同一处理
+      final msg = e.toString();
+      if (msg.contains('超时') || msg.contains('bulkRead')) {
+        _eventSub?.cancel();
+        _keepAlive?.cancel();
+        _pollTimer?.cancel();
+        final dead = session;
+        session = null;
+        _activeDriver = null;
+        _clearPullQueues();
+        disconnectNote = '相机无响应，连接已断开，请重新连接';
+        if (dead != null) {
+          unawaited(
+            dead.close().catchError((Object e) => debugPrint('关闭会话异常: $e')),
+          );
+        }
+        notifyListeners();
+        KeepAliveSync.sync();
+      }
       rethrow;
     }
   }
@@ -648,7 +815,10 @@ class CameraHub extends ChangeNotifier {
     _eventSub?.cancel();
     _keepAlive?.cancel();
     _pollTimer?.cancel();
-    await session?.close();
+    _clearPullQueues();
+    // 先复位状态让 UI 立即响应；传输收尾放后台（链路可能已死，CloseSession
+    // 可能挂起 30s，绝不能卡住断开操作）
+    final s = session;
     session = null;
     objects = [];
     thumbs.clear();
@@ -661,6 +831,9 @@ class CameraHub extends ChangeNotifier {
     _activeDriver = null;
     disconnectNote = '已断开';
     notifyListeners();
+    if (s != null) {
+      unawaited(s.close().catchError((Object e) => debugPrint('关闭会话异常: $e')));
+    }
     KeepAliveSync.sync(); // 无上传任务则停保活
   }
 

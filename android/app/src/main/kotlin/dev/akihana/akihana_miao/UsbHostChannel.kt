@@ -11,6 +11,8 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -26,8 +28,8 @@ import java.util.concurrent.TimeUnit
  *   open               -> {productName}（声明 Still Image 接口 class=6）
  *   bulkWrite          -> 写入字节数
  *   bulkRead(length)   -> Uint8List（内部循环读满或设备短包结束）
- *   interruptRead      -> 事件字节（超时返回 null）
  *   close              -> 释放接口与连接
+ * （不使用 interrupt 端点：与 bulk 传输争抢 usbfs 管道导致 Z6 掉线）
  */
 class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
     companion object {
@@ -41,70 +43,70 @@ class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
     private var claimedInterface: UsbInterface? = null
     private var bulkOut: android.hardware.usb.UsbEndpoint? = null
     private var bulkIn: android.hardware.usb.UsbEndpoint? = null
-    private var interruptIn: android.hardware.usb.UsbEndpoint? = null
-
-    // interrupt 线程持续把事件推入队列，供 interruptRead 取用
-    private var eventThread: Thread? = null
-    private val eventQueue = ArrayBlockingQueue<ByteArray>(64)
-    @Volatile private var running = false
 
     init {
         MethodChannel(engine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
-            try {
-                when (call.method) {
-                    "listDevices" -> result.success(listDevices())
-                    "bindWifi" -> result.success(bindWifi())
-                    "unbindNetwork" -> result.success(unbindNetwork())
-                    "isOnWifi" -> result.success(isOnWifi())
-                    "saveToGallery" -> {
-                        val path = call.argument<String>("path")!!
-                        val fileName = call.argument<String>("fileName")!!
-                        val subFolder = call.argument<String>("subFolder")
-                        result.success(saveToGallery(path, fileName, subFolder))
-                    }
-                    "queryGallery" -> result.success(queryGallery())
-                    "startKeepAlive" -> {
-                        val text = call.argument<String>("text") ?: "后台运行中"
-                        KeepAliveService.start(context, text)
-                        result.success(true)
-                    }
-                    "stopKeepAlive" -> {
-                        KeepAliveService.stop(context)
-                        result.success(true)
-                    }
-                    "isKeepAliveRunning" -> result.success(KeepAliveService.running)
-                    "getBattery" -> result.success(batteryInfo())
-                    "requestPermission" -> {
-                        val name = call.argument<String>("device")!!
-                        result.success(requestPermission(name))
-                    }
-                    "open" -> {
-                        val name = call.argument<String>("device")!!
-                        result.success(open(name))
-                    }
-                    "bulkWrite" -> {
-                        val data = call.argument<ByteArray>("data")!!
-                        result.success(bulkWrite(data))
-                    }
-                    "bulkRead" -> {
-                        val length = call.argument<Int>("length")!!
-                        val timeout = call.argument<Int>("timeout") ?: 30000
-                        result.success(bulkRead(length, timeout))
-                    }
-                    "interruptRead" -> {
-                        val timeout = call.argument<Int>("timeout") ?: 1000
-                        result.success(interruptRead(timeout))
-                    }
-                    "close" -> {
-                        close()
-                        result.success(null)
-                    }
-                    else -> result.notImplemented()
+            // 所有通道调用放后台线程执行：requestPermission 同步等授权最长 30s、
+            // bulkTransfer 单次超时 10s——占用主线程会导致权限广播无法送达（必然
+            // 超时失败）+ 触摸事件超时 ANR（闪退）。结果统一回主线程回复。
+            Thread {
+                fun reply(value: Any?) {
+                    Handler(Looper.getMainLooper()).post { result.success(value) }
                 }
-            } catch (e: Exception) {
-                Log.i(TAG, "USB 通道异常: ${e.javaClass.simpleName}: ${e.message}")
-                result.error("USB_ERROR", e.message, null)
-            }
+                fun replyError(message: String?) {
+                    Handler(Looper.getMainLooper()).post {
+                        result.error("USB_ERROR", message, null)
+                    }
+                }
+                try {
+                    when (call.method) {
+                        "listDevices" -> reply(listDevices())
+                        "bindWifi" -> reply(bindWifi())
+                        "unbindNetwork" -> reply(unbindNetwork())
+                        "isOnWifi" -> reply(isOnWifi())
+                        "saveToGallery" -> {
+                            val path = call.argument<String>("path")!!
+                            val fileName = call.argument<String>("fileName")!!
+                            val subFolder = call.argument<String>("subFolder")
+                            reply(saveToGallery(path, fileName, subFolder))
+                        }
+                        "queryGallery" -> reply(queryGallery())
+                        "startKeepAlive" -> {
+                            val text = call.argument<String>("text") ?: "后台运行中"
+                            KeepAliveService.start(context, text)
+                            reply(true)
+                        }
+                        "stopKeepAlive" -> {
+                            KeepAliveService.stop(context)
+                            reply(true)
+                        }
+                        "isKeepAliveRunning" -> reply(KeepAliveService.running)
+                        "getBattery" -> reply(batteryInfo())
+                        "requestPermission" -> reply(
+                            requestPermission(call.argument<String>("device")!!)
+                        )
+                        "open" -> reply(open(call.argument<String>("device")!!))
+                        "bulkWrite" -> reply(
+                            bulkWrite(call.argument<ByteArray>("data")!!)
+                        )
+                        "bulkRead" -> {
+                            val length = call.argument<Int>("length")!!
+                            val timeout = call.argument<Int>("timeout") ?: 30000
+                            reply(bulkRead(length, timeout))
+                        }
+                        "close" -> {
+                            close()
+                            reply(null)
+                        }
+                        else -> Handler(Looper.getMainLooper()).post {
+                            result.notImplemented()
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.i(TAG, "USB 通道异常: ${e.javaClass.simpleName}: ${e.message}")
+                    replyError(e.message)
+                }
+            }.start()
         }
     }
 
@@ -341,7 +343,9 @@ class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
         }
         val itf = siInterface
             ?: throw IllegalStateException("设备无 Still Image 接口（相机 USB 模式请设为 PTP/MTP）")
-        if (!conn.claimInterface(itf, true)) {
+        // force=false：强制复位接口会触发部分相机（Z6 实测）USB 控制器
+        // 重置/重枚举，导致连接数秒后掉线、大传输中途消失
+        if (!conn.claimInterface(itf, false)) {
             conn.close()
             throw IllegalStateException("无法声明 USB 接口")
         }
@@ -351,13 +355,13 @@ class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
                 UsbConstants.USB_ENDPOINT_XFER_BULK ->
                     if (ep.direction == UsbConstants.USB_DIR_OUT) bulkOut = ep
                     else bulkIn = ep
-                UsbConstants.USB_ENDPOINT_XFER_INT ->
-                    if (ep.direction == UsbConstants.USB_DIR_IN) interruptIn = ep
             }
         }
         connection = conn
         claimedInterface = itf
-        startEventThread()
+        // 注意：不使用 interrupt 端点——同步轮询/常驻 UsbRequest 都会与
+        // bulk 数据传输在内核 usbfs 层互相争抢（Z6 实测数据管道卡死）。
+        // 尼康事件改用厂商命令 NikonGetEvent(0x90C1) 串行查询（Dart 侧）。
         Log.i(TAG, "USB 已连接: ${device.deviceName} bulkOut=${bulkOut != null} bulkIn=${bulkIn != null}")
         return mapOf("productName" to (device.productName ?: device.deviceName))
     }
@@ -380,7 +384,11 @@ class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
         return sent
     }
 
-    /** 循环读满 length 字节；设备短包（提前结束）则返回已读部分 */
+    /** 循环读满 length 字节；设备短包（提前结束）则返回已读部分。
+     *  注意：绝不做投机 ZLP 吸收——请求长度恒为 16384（512 对齐），
+     *  若在此处补读 512 字节，会把数据流中间下一块真实数据当残留读走丢弃，
+     *  导致分块下载每块少 ~1.5KB、进度永远凑不满而挂起（卡 1% 的根因）。
+     *  真 ZLP 会以 0 长度自然返回，交由 Dart 侧 _readContainerStart 吸收。 */
     private fun bulkRead(length: Int, timeoutMs: Int): ByteArray {
         checkOpen()
         val out = ByteArray(length)
@@ -398,43 +406,16 @@ class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
             }
             got += n
         }
-        // ZLP 处理：PTP 数据容器总长恰为端点 maxPacket(512) 整数倍时，
-        // 相机会追加零长度包；残留的 ZLP 会污染下一事务的读取。
-        // 读满且长度对齐时用短超时吸收一次可能的 ZLP。
-        if (got == length && length % 512 == 0) {
-            val zlp = ByteArray(512)
-            connection!!.bulkTransfer(bulkIn, zlp, zlp.size, 50)
-        }
         return out.copyOf(got)
     }
 
-    private fun startEventThread() {
-        val ep = interruptIn ?: return
-        running = true
-        eventThread = Thread {
-            val buf = ByteArray(64)
-            while (running) {
-                val n = connection?.bulkTransfer(ep, buf, buf.size, 200) ?: break
-                if (n > 0) {
-                    eventQueue.offer(buf.copyOf(n))
-                }
-            }
-        }.apply { isDaemon = true; name = "ptp-event"; start() }
-    }
-
-    private fun interruptRead(timeoutMs: Int): ByteArray? =
-        eventQueue.poll(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-
     private fun close() {
-        running = false
-        eventThread = null
         try { claimedInterface?.let { connection?.releaseInterface(it) } } catch (_: Exception) {}
         try { connection?.close() } catch (_: Exception) {}
         connection = null
         claimedInterface = null
         bulkOut = null
         bulkIn = null
-        interruptIn = null
         Log.i(TAG, "USB 已断开")
     }
 }

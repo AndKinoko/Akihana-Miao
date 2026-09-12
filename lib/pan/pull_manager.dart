@@ -94,6 +94,13 @@ class PullManager extends ChangeNotifier {
     jobs.remove(job);
     notifyListeners();
   }
+
+  /// 链路断开/死亡：清空全部任务（含排队中），避免面板残留死任务
+  void clearAll() {
+    if (jobs.isEmpty) return;
+    jobs.clear();
+    notifyListeners();
+  }
 }
 
 /// 本地库变更广播：拉取入库 / 上传后删除时通知「已拉取」面板重扫

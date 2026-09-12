@@ -418,6 +418,7 @@ class WifiLink implements PtpLink {
     List<int> params, {
     List<int> sendData = const [],
     Duration timeout = const Duration(seconds: 30),
+    void Function(int received)? onData,
   }) {
     // 串行化：同一命令连接严格单事务在途（与 AeroShutter 一致）
     Future<List<int>> run() => _runTransact(code, params, sendData, timeout);

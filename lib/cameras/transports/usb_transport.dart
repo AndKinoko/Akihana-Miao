@@ -55,18 +55,6 @@ class UsbTransport implements PtpTransport {
     return Uint8List.fromList(data ?? const []);
   }
 
-  /// 读取 interrupt 事件（PTP 事件容器），无事件返回 null
-  @override
-  Future<Uint8List?> readEvent({
-    Duration timeout = const Duration(seconds: 1),
-  }) async {
-    if (_closed) return null;
-    final data = await _channel.invokeMethod<List<int>>('interruptRead', {
-      'timeout': timeout.inMilliseconds,
-    });
-    return data == null ? null : Uint8List.fromList(data);
-  }
-
   @override
   Future<void> close() async {
     if (_closed) return;

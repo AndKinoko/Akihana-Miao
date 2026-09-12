@@ -27,6 +27,9 @@ class UploadItem {
   String? error;
   int? folderId;
 
+  /// 用户已取消：在途上传在下一个分片边界中止，进度回调不再刷新
+  bool cancelled = false;
+
   String get sizeText {
     final n = size;
     if (n < 1024) return '$n B';
@@ -99,6 +102,33 @@ class UploadQueue extends ChangeNotifier {
     _pump();
   }
 
+  /// 取消一条：等待/失败直接移出队列；上传中置标志（下一个分片边界中止）并移出。
+  /// 已完成的保留（用户需要看到结果）。
+  void cancel(UploadItem item) {
+    if (item.status == UploadStatus.done) return;
+    item.cancelled = true;
+    _items.remove(item);
+    notifyListeners();
+    _pump();
+  }
+
+  /// 全部取消：清空队列（含中止在途上传），保留已完成条目
+  void cancelAll() {
+    final removable = _items
+        .where((i) => i.status != UploadStatus.done)
+        .toList(growable: false);
+    if (removable.isEmpty) return;
+    for (final i in removable) {
+      i.cancelled = true;
+      _items.remove(i);
+    }
+    notifyListeners();
+    _pump();
+  }
+
+  /// 是否还有可取消的任务（等待/上传中/失败）
+  bool get hasCancellable => _items.any((i) => i.status != UploadStatus.done);
+
   void enqueue(List<File> files) {
     for (final f in files) {
       _items.add(UploadItem(f.path, f.uri.pathSegments.last, f.lengthSync()));
@@ -158,6 +188,7 @@ class UploadQueue extends ChangeNotifier {
   }
 
   Future<void> _upload(UploadItem item) async {
+    if (item.cancelled) return;
     item
       ..status = UploadStatus.uploading
       ..progress = 0;
@@ -170,7 +201,9 @@ class UploadQueue extends ChangeNotifier {
         item.filePath,
         fileName: item.fileName,
         folderId: item.folderId,
+        isCancelled: () => item.cancelled,
         onProgress: (sent, total) {
+          if (item.cancelled) return;
           final p = total > 0 ? sent / total : 0.0;
           if ((p - item.progress).abs() > 0.005 || p >= 1.0) {
             item.progress = p;
@@ -178,6 +211,7 @@ class UploadQueue extends ChangeNotifier {
           }
         },
       );
+      if (item.cancelled) return;
       item
         ..status = UploadStatus.done
         ..progress = 1.0;

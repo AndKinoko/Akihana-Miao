@@ -87,13 +87,21 @@ class KeepAliveService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val text = intent?.getStringExtra("text") ?: "后台运行中"
         val notification = buildNotification(this, text)
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(
-                NOTIF_ID, notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-            )
-        } else {
-            startForeground(NOTIF_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(
+                    NOTIF_ID, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                )
+            } else {
+                startForeground(NOTIF_ID, notification)
+            }
+        } catch (e: Exception) {
+            // startForeground 失败（系统限制等）→ 不 stopSelf 会触发
+            // 系统 "Stop FGS timeout" 强杀；记录原因便于诊断
+            Log.i(TAG, "startForeground 失败: ${e.javaClass.simpleName}: ${e.message}")
+            stopSelf()
+            return START_NOT_STICKY
         }
         acquireLocks()
         running = true

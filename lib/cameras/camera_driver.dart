@@ -12,6 +12,9 @@ enum NewFileStrategy {
   /// 相机主动推 ObjectAdded 事件（interrupt / 事件通道）
   eventPush,
 
+  /// 周期性发尼康厂商事件检查命令（0x90C1），解析事件数组
+  eventPoll,
+
   /// 不保证推事件，用 GetObjectHandles 差集轮询兜底（索尼等）
   pollHandles,
 }

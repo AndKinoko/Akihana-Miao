@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 
 import '../cameras/camera_hub.dart';
 import 'common.dart';
+import 'home_page.dart';
+import 'transfer_page.dart';
 import 'widgets.dart';
 
 /// 供相机页入口跳转
@@ -63,12 +65,24 @@ class _CameraAlbumPageState extends State<CameraAlbumPage> {
     hub.updateRange(start, end);
   }
 
-  Future<void> _batchPull(BuildContext context, CameraHub hub) async {
+  /// 多选拉取：任务先同步登记为「排队中」，随即跳转到传输-拉取面板，
+  /// 用户直接看到完整队列与进度；完成/失败提示经 hub.pullNote 由相机页弹一次。
+  void _batchPull(BuildContext context, CameraHub hub) {
     final sel = Set<int>.from(hub.selectedHandles);
-    final n = await hub.batchPull(sel);
-    if (context.mounted) {
-      AppToast.show(context, '已拉取 $n 张');
-    }
+    hub.clearSelection();
+    transferTabIndex.value = 0;
+    homeTabIndex.value = 1;
+    Navigator.of(context).pop(); // 关掉二级页，露出主页传输 tab
+    unawaited(
+      hub.batchPull(sel).then((n) {
+        final err = hub.lastPullError;
+        hub.setPullNote(
+          n > 0 || err == null
+              ? '已拉取 $n 张'
+              : '拉取失败：${err.length > 60 ? '${err.substring(0, 60)}…' : err}',
+        );
+      }),
+    );
   }
 
   @override

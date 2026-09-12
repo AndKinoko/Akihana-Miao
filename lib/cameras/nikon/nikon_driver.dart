@@ -57,6 +57,14 @@ class PtpCameraSession extends CameraSession {
     return _ptp.link.responderName.trim();
   }
 
+  /// 尼康厂商事件检查（0x90C1）：
+  /// 数据格式 [count u16][eventCode u16][param u32] × count
+  @override
+  Future<List<PtpEvent>> getNikonEvents() async {
+    final data = await _ptp.getNikonEvents();
+    return data;
+  }
+
   /// 流式下载对象；返回收到的总字节数。
   /// 分块不支持时由 PtpSession 自动回退 GetObject。
   @override
@@ -114,11 +122,14 @@ class NikonDriver implements CameraDriver {
   @override
   List<int> get usbVendorIds => const [0x04B0, 0];
 
+  // 实验结论（2026-09-13）：USB 上 0x90C1 事件检查疑似触发 Z6 掉线
+  // （连接后 20~30 秒相机自我复位），暂改用句柄差集轮询（纯标准命令）。
+  // 待硬件层面（供电/线材）排除后再验证 0x90C1。
   @override
-  NewFileStrategy get newFileStrategy => NewFileStrategy.eventPush;
+  NewFileStrategy get newFileStrategy => NewFileStrategy.pollHandles;
 
   @override
-  Duration get pollInterval => const Duration(seconds: 4);
+  Duration get pollInterval => const Duration(seconds: 5);
 
   /// 枚举 USB 上的 Still Image 设备（即 PTP 相机）
   @override

@@ -63,6 +63,14 @@ class CameraPage extends StatelessWidget {
             if (context.mounted) AppToast.show(context, note);
           });
         }
+        // 一次性批量拉取结果提示（多选拉取跳转后弹一次即清）
+        final pnote = hub.pullNote;
+        if (pnote != null) {
+          hub.pullNote = null;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (context.mounted) AppToast.show(context, pnote);
+          });
+        }
         return Stack(
           children: [
             // 列表：连接/断开切换时淡入+轻微上滑，平滑过渡

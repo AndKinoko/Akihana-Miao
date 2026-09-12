@@ -5,6 +5,11 @@ import 'package:http/http.dart' as http;
 
 import '../core/config.dart';
 
+/// 用户取消上传（流式分片间检测，抛出即中止在途请求）
+class UploadCancelled implements Exception {
+  const UploadCancelled();
+}
+
 /// 网盘 API 客户端（契约见 BUILD_SPEC.md §3）
 /// - 统一信封 { success, data, error }
 /// - 401 自动用已存账号密码重登一次再重试
@@ -115,13 +120,20 @@ class PanClient {
     required String fileName,
     int? folderId,
     void Function(int sent, int total)? onProgress,
+    bool Function()? isCancelled,
   }) async {
     try {
-      await _uploadOnce(filePath, fileName, folderId, onProgress);
+      await _uploadOnce(filePath, fileName, folderId, onProgress, isCancelled);
     } on ApiException catch (e) {
       if (e.status == 401 && AppConfig.instance.password.isNotEmpty) {
         await login();
-        await _uploadOnce(filePath, fileName, folderId, onProgress);
+        await _uploadOnce(
+          filePath,
+          fileName,
+          folderId,
+          onProgress,
+          isCancelled,
+        );
         return;
       }
       rethrow;
@@ -133,11 +145,14 @@ class PanClient {
     String fileName,
     int? folderId,
     void Function(int, int)? onProgress,
+    bool Function()? isCancelled,
   ) async {
     final file = File(filePath);
     final total = await file.length();
     var sent = 0;
+    // 流式分片间检查取消标志：抛出后 http 请求随流错误一并中止
     final counting = file.openRead().map((chunk) {
+      if (isCancelled?.call() == true) throw const UploadCancelled();
       sent += chunk.length;
       onProgress?.call(sent, total);
       return chunk;

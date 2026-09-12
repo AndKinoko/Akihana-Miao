@@ -21,6 +21,7 @@ class AkihanaApp extends StatelessWidget {
       valueListenable: ThemeController.instance.mode,
       builder: (context, mode, _) => MaterialApp(
         title: 'Akihana Miao',
+        debugShowCheckedModeBanner: false,
         theme: AppTheme.light(),
         darkTheme: AppTheme.dark(),
         themeMode: mode,

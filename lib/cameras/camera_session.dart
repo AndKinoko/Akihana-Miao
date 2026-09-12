@@ -44,6 +44,9 @@ abstract class CameraSession {
   /// 相机型号：GetDeviceInfo 优先，握手友好名兜底；拿不到返回空串
   Future<String> model();
 
+  /// 尼康厂商事件检查（0x90C1）；非尼康实现返回空列表
+  Future<List<PtpEvent>> getNikonEvents() async => const [];
+
   /// 设备信息（厂商/型号）
   Future<PtpDeviceInfo> getDeviceInfo();
 

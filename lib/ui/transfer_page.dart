@@ -455,6 +455,8 @@ class UploadProgressPanel extends StatelessWidget {
     }
     return Column(
       children: [
+        // 顶部固定：暂停提示 + 全部暂停/全部取消（列表再长也能操作），
+        // 下方 Expanded(ListView) 承载卡片流，避免 Column 溢出且可滚动
         if (paused)
           AppCard(
             flat: true,
@@ -476,76 +478,114 @@ class UploadProgressPanel extends StatelessWidget {
               ],
             ),
           ),
-        for (final it in items)
-          AppCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 2, 16, 6),
+          child: Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () => UploadQueue.instance.manualPaused
+                      ? UploadQueue.instance.resumeAll()
+                      : UploadQueue.instance.pauseAll(),
+                  icon: Icon(
+                    UploadQueue.instance.manualPaused
+                        ? Icons.play_arrow
+                        : Icons.pause,
+                    size: 18,
+                  ),
+                  label: Text(
+                    UploadQueue.instance.manualPaused ? '继续上传' : '全部暂停',
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: UploadQueue.instance.hasCancellable
+                      ? () => UploadQueue.instance.cancelAll()
+                      : null,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Theme.of(context).colorScheme.error,
+                  ),
+                  icon: const Icon(Icons.close, size: 18),
+                  label: const Text('全部取消'),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.only(bottom: 24),
+            children: [
+              for (final it in items)
+                AppCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
                         children: [
-                          Text(
-                            it.fileName,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w500,
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  it.fileName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  _statusLine(it),
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
-                          const SizedBox(height: 2),
-                          Text(
-                            _statusLine(it),
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.onSurfaceVariant,
-                            ),
+                          Row(
+                            children: [
+                              switch (it.status) {
+                                UploadStatus.done => const StatusChip.ok('已完成'),
+                                UploadStatus.failed => TextButton(
+                                  onPressed: () =>
+                                      UploadQueue.instance.retry(it),
+                                  child: const Text('重试'),
+                                ),
+                                UploadStatus.uploading => StatusChip.info(
+                                  '${(it.progress * 100).toStringAsFixed(0)}%',
+                                ),
+                                UploadStatus.waiting => const StatusChip.warn(
+                                  '等待',
+                                ),
+                              },
+                              // 取消：等待/失败直接移出；上传中中止在途传输
+                              if (it.status != UploadStatus.done)
+                                TextButton(
+                                  onPressed: () =>
+                                      UploadQueue.instance.cancel(it),
+                                  child: const Text('取消'),
+                                ),
+                            ],
                           ),
                         ],
                       ),
-                    ),
-                    switch (it.status) {
-                      UploadStatus.done => const StatusChip.ok('已完成'),
-                      UploadStatus.failed => TextButton(
-                        onPressed: () => UploadQueue.instance.retry(it),
-                        child: const Text('重试'),
-                      ),
-                      UploadStatus.uploading => StatusChip.info(
-                        '${(it.progress * 100).toStringAsFixed(0)}%',
-                      ),
-                      UploadStatus.waiting => const StatusChip.warn('等待'),
-                    },
-                  ],
+                      if (it.status == UploadStatus.uploading) ...[
+                        const SizedBox(height: 10),
+                        ThinProgressBar(value: it.progress),
+                      ],
+                    ],
+                  ),
                 ),
-                if (it.status == UploadStatus.uploading) ...[
-                  const SizedBox(height: 10),
-                  ThinProgressBar(value: it.progress),
-                ],
-              ],
-            ),
-          ),
-        // 全部暂停/继续
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 2, 16, 0),
-          child: SizedBox(
-            width: double.infinity,
-            child: OutlinedButton.icon(
-              onPressed: () => UploadQueue.instance.manualPaused
-                  ? UploadQueue.instance.resumeAll()
-                  : UploadQueue.instance.pauseAll(),
-              icon: Icon(
-                UploadQueue.instance.manualPaused
-                    ? Icons.play_arrow
-                    : Icons.pause,
-                size: 18,
-              ),
-              label: Text(UploadQueue.instance.manualPaused ? '继续上传' : '全部暂停'),
-            ),
+            ],
           ),
         ),
       ],

@@ -35,6 +35,13 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
+            <!-- 相机 USB 插入时出现在系统选择框（否则其他 App 会抢占相机） -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter"/>
         </activity>
         <!-- 后台保活前台服务：抬升进程优先级，锁屏/Doze 下维持 PTP 链路与上传队列 -->
         <service
