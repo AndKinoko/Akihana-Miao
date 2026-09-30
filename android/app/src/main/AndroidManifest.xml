@@ -9,6 +9,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- USB Host：有线直连相机（PTP over USB） -->
     <uses-feature android:name="android.hardware.usb.host" android:required="false"/>
+    <!-- 明文 HTTP 放行：Android 9+ 默认禁止明文，而本应用有三处必须走明文——
+         ① 网盘地址由用户填写（常见是局域网 http://192.168.x.x:100，地址不固定，
+            没法预先枚举域名做白名单）② 佳能 CCAPI http://相机:8080
+         ③ 索尼 http://192.168.122.1:64321。后两者是相机厂商协议，本身就没有 TLS。
+         副作用要说清楚：账号与密码会以明文经过网络，设置页对 http:// 地址有告警。 -->
     <application
         android:label="Akihana Miao"
         android:name="${applicationName}"

@@ -72,6 +72,11 @@ class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
                             reply(saveToGallery(path, fileName, subFolder, forceDownload))
                         }
                         "queryGallery" -> reply(queryGallery())
+                        "deleteMedia" -> {
+                            val uri = call.argument<String>("uri")
+                            val path = call.argument<String>("path")
+                            reply(deleteMedia(uri, path))
+                        }
                         "startKeepAlive" -> {
                             val text = call.argument<String>("text") ?: "后台运行中"
                             KeepAliveService.start(context, text)
@@ -253,6 +258,62 @@ class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
     }
 
     /**
+     * 删除相册/下载目录里的媒体（「上传后删除本地副本」用）。
+     *
+     * [uri] 为 saveToGallery 的返回值，直接按行删除；[path] 为绝对路径，
+     * 在三张表里反查 DATA 列。两者都失败时退回删普通文件（可能本就不在
+     * MediaStore 里）。返回是否真的删掉了。
+     *
+     * 注意：必须走 ContentResolver——只删文件不删行会留下媒体库幽灵条目。
+     */
+    private fun deleteMedia(uri: String?, path: String?): Boolean {
+        if (Build.VERSION.SDK_INT < 29) return false
+        if (uri != null) {
+            try {
+                val n = context.contentResolver.delete(
+                    android.net.Uri.parse(uri), null, null
+                )
+                if (n > 0) {
+                    Log.i(TAG, "已从相册删除: $uri")
+                    return true
+                }
+            } catch (e: Exception) {
+                Log.i(TAG, "按 uri 删除失败: ${e.message}")
+            }
+        }
+        if (path == null) return false
+        for (c in mediaCollections()) {
+            try {
+                val sel = "${android.provider.MediaStore.MediaColumns.DATA}=?"
+                val n = context.contentResolver.delete(c, sel, arrayOf(path))
+                if (n > 0) {
+                    Log.i(TAG, "已按路径删除媒体行: $path")
+                    return true
+                }
+            } catch (_: Exception) {
+            }
+        }
+        // 不在媒体库里（例如应用私有目录的暂存副本）：直接删文件
+        return try {
+            val f = java.io.File(path)
+            f.exists() && f.delete()
+        } catch (e: Exception) {
+            Log.i(TAG, "删除文件失败: ${e.message}")
+            false
+        }
+    }
+
+    /** 本应用会写入的三张 MediaStore 表 */
+    private fun mediaCollections() = listOf(
+        android.provider.MediaStore.Images.Media.getContentUri(
+            android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY),
+        android.provider.MediaStore.Video.Media.getContentUri(
+            android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY),
+        android.provider.MediaStore.Downloads.getContentUri(
+            android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY),
+    )
+
+    /**
      * 查询本应用存入系统相册/下载目录的媒体文件（AkihanaMiao 专属目录）。
      * 应用查询自己贡献的媒体无需存储权限；DATA 列为可直接读的绝对路径。
      */
@@ -264,45 +325,65 @@ class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
             "Download/AkihanaMiao",
         )
         val out = mutableListOf<Map<String, String>>()
-        val collections = listOf(
-            android.provider.MediaStore.Images.Media.getContentUri(
-                android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY),
-            android.provider.MediaStore.Video.Media.getContentUri(
-                android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY),
-            android.provider.MediaStore.Downloads.getContentUri(
-                android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY),
+        // 只取专属目录：原先三个 collection 全表扫描（每行都在 Kotlin 侧比较
+        // 路径前缀），卡上几万条媒体时每次刷新都是全量游标遍历
+        val sel = dirs.joinToString(" OR ") {
+            "${android.provider.MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
+        }
+        val args = dirs.map { "$it%" }.toTypedArray()
+        val projection = arrayOf(
+            android.provider.MediaStore.MediaColumns.DISPLAY_NAME,
+            android.provider.MediaStore.MediaColumns.RELATIVE_PATH,
+            android.provider.MediaStore.MediaColumns.DATA,
+            android.provider.MediaStore.MediaColumns.SIZE,
+            android.provider.MediaStore.MediaColumns.DATE_MODIFIED,
         )
-        for (c in collections) {
+        for (c in mediaCollections()) {
             try {
-                context.contentResolver.query(
-                    c,
-                    arrayOf(
-                        android.provider.MediaStore.MediaColumns.DISPLAY_NAME,
-                        android.provider.MediaStore.MediaColumns.RELATIVE_PATH,
-                        android.provider.MediaStore.MediaColumns.DATA,
-                        android.provider.MediaStore.MediaColumns.SIZE,
-                        android.provider.MediaStore.MediaColumns.DATE_MODIFIED,
-                    ),
-                    null, null, null,
-                )?.use { cursor ->
-                    while (cursor.moveToNext()) {
-                        val rel = cursor.getString(1) ?: continue
-                        if (dirs.none { rel.startsWith(it) }) continue
-                        out.add(
-                            mapOf(
-                                "name" to (cursor.getString(0) ?: ""),
-                                "path" to (cursor.getString(2) ?: ""),
-                                "size" to (cursor.getLong(3)).toString(),
-                                "dateModified" to (cursor.getLong(4)).toString(),
-                            )
-                        )
-                    }
-                }
+                // 少数机型的 provider 不支持 RELATIVE_PATH 上的 selection：
+                // 抛异常就退回全表扫描（行为与从前一致，只是慢）
+                val rows = queryInto(c, projection, sel, args, dirs)
+                    ?: queryInto(c, projection, null, null, dirs)
+                if (rows != null) out.addAll(rows)
             } catch (e: Exception) {
                 Log.i(TAG, "queryGallery 查询失败: ${e.message}")
             }
         }
         return out
+    }
+
+    /** 执行一次查询；异常时返回 null 让调用方决定是否回退 */
+    private fun queryInto(
+        collection: android.net.Uri,
+        projection: Array<String>,
+        selection: String?,
+        selectionArgs: Array<String>?,
+        dirs: List<String>,
+    ): List<Map<String, String>>? {
+        return try {
+            val rows = mutableListOf<Map<String, String>>()
+            context.contentResolver.query(
+                collection, projection, selection, selectionArgs, null,
+            )?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val rel = cursor.getString(1) ?: continue
+                    // selection 已过滤，这里再按前缀核准一次（回退路径全靠它）
+                    if (dirs.none { rel.startsWith(it) }) continue
+                    rows.add(
+                        mapOf(
+                            "name" to (cursor.getString(0) ?: ""),
+                            "path" to (cursor.getString(2) ?: ""),
+                            "size" to (cursor.getLong(3)).toString(),
+                            "dateModified" to (cursor.getLong(4)).toString(),
+                        )
+                    )
+                }
+            }
+            rows
+        } catch (e: Exception) {
+            Log.i(TAG, "queryGallery 带条件查询失败，将回退全表: ${e.message}")
+            null
+        }
     }
 
     private fun deviceByName(name: String): UsbDevice =

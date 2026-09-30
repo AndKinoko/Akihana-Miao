@@ -6,7 +6,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'camera_driver.dart';
 import 'camera_session.dart';
-import 'ptp/ptp_session.dart' show PtpEvent, PtpObjectInfo, Ptp;
+import 'ptp/ptp_session.dart' show PtpEvent, PtpObjectInfo, PtpException;
 import 'ptp/ptp_link.dart' show DownloadCancelled;
 import 'transports/net_binder.dart';
 import '../core/config.dart';
@@ -20,6 +20,24 @@ class ObjectRow {
   const ObjectRow({required this.handle, required this.info});
   final int handle;
   final PtpObjectInfo info;
+}
+
+/// 落盘结果不可信（截断 / 零字节 / 相册落盘失败）：按失败处理。
+///
+/// 存在的意义：`CameraSession.download()` 的契约是「短包即正常返回已读部分」
+/// （见 PtpTransport.read 注释），所以**截断不是异常路径而是正常返回**——
+/// 不显式拦截，一份坏图会被写进相册、标记完成、上传网盘。
+class DownloadFailure implements Exception {
+  const DownloadFailure(this.message, {this.keepFile = false});
+
+  final String message;
+
+  /// true = 数据本身是好的，只是没进到用户可见的位置（相册落盘失败）。
+  /// 此时**不要删文件**——删了才是真的丢数据。
+  final bool keepFile;
+
+  @override
+  String toString() => message;
 }
 
 /// 连接流程阶段（驱动连接浮层动画）
@@ -49,6 +67,9 @@ class CameraHub extends ChangeNotifier {
 
   /// 轮询连续失败计数（设备掉线感知）
   int _pollFailCount = 0;
+
+  /// 对象列表连续「异常缩水」计数（见 _pollNewObjects 的列表即全集防护）
+  int _shrinkStreak = 0;
 
   /// 最近一次 USB 发现的相机描述（型号兜底用）
   String? _lastCamLabel;
@@ -155,10 +176,10 @@ class CameraHub extends ChangeNotifier {
       await _finishConnect(() => driver.connectUsb(cam.id), driver);
     } catch (e) {
       if (!_cancelled) {
-        final msg = e.toString();
         // 读取超时最常见的原因是相机被其他应用占用
-        // （接入时的系统选择框选了别的 App，或相册/文件管理器正在浏览相机）
-        final hint = msg.contains('超时') || msg.contains('bulkRead')
+        // （接入时的系统选择框选了别的 App，或相册/文件管理器正在浏览相机）。
+        // 判据走异常分类，不再匹配「超时/bulkRead」这类文案
+        final hint = _isLinkFailure(e)
             ? '$e\n排查：接入相机时系统弹框请选择 Akihana；'
                   '关闭正在浏览相机的其他应用；或相机关机重开后再试'
             : '连接失败：$e';
@@ -265,15 +286,14 @@ class CameraHub extends ChangeNotifier {
       final handles = await s.listObjectHandles();
       final rows = <ObjectRow>[];
       // 列表是扁平全量（storage=all, parent=0），文件夹与文件混在一起。
-      // 我们不建目录树，所以对「无扩展名 + 有子对象区间」的句柄直接合成
-      // 目录行，省掉一次 PTP 事务：卡上 3000 个对象时，N 次串行往返
-      // GetObjectInfo 就是数分钟的连接等待（相机无响应）。
-      final dirs = await _folderHandles(s, handles);
+      // 不建目录树：逐个 GetObjectInfo 会把 isFolder 一并带回来，目录与文件
+      // 一并正确归类，一次事务一个对象。
+      //
+      // 这里曾经有一版「目录句柄猜测」（用句柄相邻性推断父目录）作为提速手段，
+      // 已删除：PTP 只保证「子句柄 > 父句柄」不保证相邻，句柄连续时它反而
+      // 让每个句柄被查询两次（先探测、主循环再查一遍），净效果是事务翻倍；
+      // 而它想省下的那次 GetObjectInfo 本来就是必要的。
       for (final h in handles) {
-        if (dirs.contains(h)) {
-          rows.add(ObjectRow(handle: h, info: _syntheticFolder(s, h)));
-          continue;
-        }
         try {
           rows.add(ObjectRow(handle: h, info: await s.getObjectInfo(h)));
         } catch (_) {
@@ -413,45 +433,6 @@ class CameraHub extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 目录句柄推断：返回确信是文件夹的句柄集合。
-  ///
-  /// PTP 的 GetObjectHandles(storage=all, parent=0) 返回的是**所有存储卡的
-  /// 全部顶层对象**，因此 handle 空间是分段递增的：一个文件夹的子对象
-  /// 句柄紧跟在它自己之后（PTP 规范要求子对象句柄 > 父句柄）。据此取
-  /// 每个句柄的「下一个句柄」做一次探测——若它返回 0x3001(Association)
-  /// 则当前句柄必是目录。这只对目录产生 N 次事务，文件一个不多。
-  ///
-  /// 探测失败/不支持时返回空集，调用方退回到逐个 GetObjectInfo 的老路���，
-  /// 行为不变（只是慢）。命中与否都必须是安全的：猜错最多是漏标一个
-  /// 图标，而 `info.isFolder` 的过滤语义在任何情况下都不会漏掉文件。
-  Future<Set<int>> _folderHandles(CameraSession s, List<int> handles) async {
-    if (handles.length < 2) return const {};
-    final sorted = List<int>.of(handles)..sort();
-    final dirs = <int>{};
-    // 一次事务判断一个句柄；目录通常只占列表的一小部分，命中即止，
-    // 上限取列表长度保证最坏情况不超过原来的一次性全读
-    for (var i = 0; i < sorted.length - 1 && dirs.length < sorted.length; i++) {
-      final next = sorted[i + 1];
-      if (next != sorted[i] + 1) continue; // 句柄不连续 → 中间隔着别的存储卡，跳过
-      try {
-        final info = await s.getObjectInfo(next);
-        if (info.isFolder) dirs.add(sorted[i]);
-      } catch (_) {
-        /* 读不出来就当不是目录 */
-      }
-    }
-    return dirs;
-  }
-
-  /// 目录的合成 PtpObjectInfo（只有 isFolder 与文件名有意义）
-  PtpObjectInfo _syntheticFolder(CameraSession s, int handle) => PtpObjectInfo(
-    storageId: 0xFFFFFFFF,
-    objectFormat: Ptp.ofcAssociation,
-    size: 0,
-    filename: '',
-    captureDate: null,
-  );
-
   /// 文件在前、文件夹在后；文件按拍摄时间倒序（最近在顶）
   void _sortRows(List<ObjectRow> rows) {
     final folders = rows.where((r) => r.info.isFolder).toList();
@@ -518,7 +499,7 @@ class CameraHub extends ChangeNotifier {
       if (session != s || events.isEmpty) return;
       var changed = false;
       for (final ev in events) {
-        final handle = ev.params.isEmpty ? null : ev.params.first;
+        final handle = _eventHandle(ev);
         if (handle == null) continue;
         if (ev.eventCode == PtpEvent.objectRemoved) {
           objects.removeWhere((r) => r.handle == handle);
@@ -544,22 +525,41 @@ class CameraHub extends ChangeNotifier {
     _pollFailCount++;
     debugPrint('轮询失败 x$_pollFailCount: $e');
     if (_pollFailCount < 3) return;
+    _linkLost('相机无响应，连接已断开，请重新连接');
+  }
+
+  /// 链路死亡统一清理（轮询连败 / 事件流关闭 / 下载超时 三条路径共用）。
+  /// 此前三处各自复制一遍同样的收尾代码，改一处必漏两处。
+  void _linkLost(String note) {
     _eventSub?.cancel();
+    _eventSub = null;
     _keepAlive?.cancel();
     _pollTimer?.cancel();
     _pollFailCount = 0;
+    _clearPullQueues();
     final dead = session;
     session = null;
     _activeDriver = null;
-    _clearPullQueues();
-    disconnectNote = '相机无响应，连接已断开，请重新连接';
-    if (dead != null) {
-      unawaited(
-        dead.close().catchError((Object e) => debugPrint('关闭会话异常: $e')),
-      );
-    }
+    disconnectNote = note;
     notifyListeners();
+    if (dead != null) {
+      unawaited(dead.close().catchError((Object e) => debugPrint('关闭会话异常: $e')));
+    }
+    // 相机热点会把整个进程绑在没有互联网的网络上（防 ColorOS 智能选网）。
+    // 链路死了必须解开，否则后续上传（含「立即上传」档，它不走 gate 的
+    // 解绑分支）全部出不去，且没有任何恢复路径
+    if (connKind == 'wifi') unawaited(NetBinder.unbind());
     KeepAliveSync.sync();
+  }
+
+  /// 链路故障判定：只认异常类型与 [PtpFailureKind]，**不匹配异常文案**。
+  /// 原实现是 `msg.contains('超时') || msg.contains('bulkRead')`——
+  /// 协议层或 Kotlin 侧改一个字，掉线检测就静默失效（文案一变即回归）。
+  static bool _isLinkFailure(Object e) {
+    if (e is PtpException) return e.isLinkFailure;
+    if (e is TimeoutException) return true;
+    if (e is SocketException) return true;
+    return false;
   }
 
   /// 句柄差集轮询（索尼等 pollHandles 策略；尼康 USB 暂用同款）。
@@ -578,6 +578,22 @@ class CameraHub extends ChangeNotifier {
           .where((r) => !handleSet.contains(r.handle))
           .map((r) => r.handle)
           .toList();
+      // 「列表即全集」防护：把「不在本轮列表里」直接等同于「已删除」是危险的——
+      // 换个只返回根 association 的机型，或相机忙时只回了半截列表，网格里的
+      // 照片会被集体清空（用户看到照片凭空消失）。列表大幅缩水时先当可疑响应
+      // 处理，连续 3 轮都如此才认账（真清空卡也只需多等 3 轮）。
+      if (removed.length > 3 && removed.length > objects.length ~/ 2) {
+        _shrinkStreak++;
+        if (_shrinkStreak < 3) {
+          debugPrint(
+            '对象列表异常缩水（本轮 ${handles.length} / 现网格 ${objects.length}），'
+            '第 $_shrinkStreak 次，本轮不执行删除',
+          );
+          return;
+        }
+      } else {
+        _shrinkStreak = 0;
+      }
       if (removed.isNotEmpty) {
         objects.removeWhere((r) => !handleSet.contains(r.handle));
         for (final h in removed) {
@@ -607,20 +623,23 @@ class CameraHub extends ChangeNotifier {
       // 事件流关闭 = 链路死亡（超时作废/相机断开）：复位，提示重连
       onDone: () {
         if (session == null) return;
-        _keepAlive?.cancel();
-        _pollTimer?.cancel();
-        session = null;
-        _clearPullQueues();
-        disconnectNote = '连接已断开，请重新连接';
-        notifyListeners();
-        KeepAliveSync.sync(); // 链路死亡：若无上传任务则停保活
+        _linkLost('连接已断开，请重新连接');
       },
     );
   }
 
+  /// 事件里的对象句柄：PIMA 15740 规定 ObjectAdded/ObjectRemoved 的首个参数
+  /// 即 ObjectHandle（部分机型会再追加存储 id 等参数）。
+  ///
+  /// 此前事件推送路径取 `params.last`、轮询路径取 `params.first`：同一批事件码
+  /// 两套语义，多参数机型上二者必有一错（尼康 WiFi 用轮询策略、同时又有事件
+  /// 通道，两条路径会在同一台机器上同时生效）。统一按规范取首个参数。
+  static int? _eventHandle(PtpEvent ev) =>
+      ev.params.isEmpty ? null : ev.params.first;
+
   Future<void> _handleEvent(CameraSession s, PtpEvent ev) async {
     if (ev.eventCode == PtpEvent.objectRemoved) {
-      final handle = ev.params.isEmpty ? null : ev.params.last;
+      final handle = _eventHandle(ev);
       if (handle == null) return;
       objects.removeWhere((r) => r.handle == handle);
       thumbs.remove(handle);
@@ -629,7 +648,7 @@ class CameraHub extends ChangeNotifier {
       return;
     }
     if (ev.eventCode != PtpEvent.objectAdded) return;
-    final handle = ev.params.isEmpty ? null : ev.params.last;
+    final handle = _eventHandle(ev);
     if (handle == null || s.isKnown(handle)) return;
     await _processNewHandle(s, handle);
   }
@@ -700,9 +719,11 @@ class CameraHub extends ChangeNotifier {
         busy = true;
         notifyListeners();
         try {
-          await _downloadJob(s, t.job, t.handle, t.info);
-          autoCount++;
-          autoBytes += t.info.size;
+          // 返回 false = 取消或失败（含完整性校验不过）：不计入「本次自动拉取」
+          if (await _downloadJob(s, t.job, t.handle, t.info)) {
+            autoCount++;
+            autoBytes += t.info.size;
+          }
         } catch (e) {
           debugPrint('自动拉取失败 ${t.info.filename}: $e');
         } finally {
@@ -752,9 +773,15 @@ class CameraHub extends ChangeNotifier {
       if (session == null || s != session) break;
       PullManager.instance.start(job);
       try {
-        await _downloadJob(s, job, handle, info);
-        okCount++;
+        // 取消/失败都不计入成功数：此前 DownloadCancelled 被吞掉后正常返回，
+        // 拔线也会报「已拉取 N 张」，与实际成功数不符
+        if (await _downloadJob(s, job, handle, info)) {
+          okCount++;
+        } else {
+          errors.add('${info.filename}: ${job.error ?? '拉取失败'}');
+        }
       } catch (e) {
+        // _downloadJob 内部已兜底，这里只防它自身抛错
         errors.add('${info.filename}: $e');
       }
     }
@@ -771,7 +798,11 @@ class CameraHub extends ChangeNotifier {
   List<ObjectRow> pullAllCandidates() =>
       fileRows.where((r) => !pulledNames.contains(r.info.filename)).toList();
 
-  Future<void> _downloadJob(
+  /// 拉取并落盘一个对象。
+  ///
+  /// 返回 true = 完整落盘且已进相册/下载目录；false = 取消或失败（半成品已清理，
+  /// 失败原因已记入任务）。**调用方必须用返回值判断成败**，不能把正常返回当作成功。
+  Future<bool> _downloadJob(
     CameraSession s,
     PullJob job,
     int handle,
@@ -788,12 +819,19 @@ class CameraHub extends ChangeNotifier {
         File('${saveDir.path}/${await s.outputName(handle, info)}'),
       );
       final sink = target.openWrite();
+      // 后端在下载过程中报告的真实总长（WiFi 后端的 content-length 比列表
+      // 阶段拿到的 size 可靠；列表阶段 size=0 的 RAW 条目靠它回填）
+      var reportedTotal = 0;
+      final int received;
       try {
-        await s.download(
+        received = await s.download(
           handle,
           info.size,
           sink.add,
-          onProgress: (r, t) => PullManager.instance.update(job, r, total: t),
+          onProgress: (r, t) {
+            if (t > 0) reportedTotal = t;
+            PullManager.instance.update(job, r, total: t);
+          },
           // 会话被换掉（断开/拔线/链路死亡）即视为取消：在途下载在下一个
           // 分片边界中止，不必等 GetPartialObject 的 10 分钟超时
           isCancelled: () => session != s,
@@ -802,30 +840,54 @@ class CameraHub extends ChangeNotifier {
         await sink.close();
       }
 
+      // ---------- 完整性校验（此前完全缺失，是本项目最严重的数据风险） ----------
+      // 「短包即结束」是协议层的**正常返回路径**（见 PtpTransport.read 注释：
+      // 设备提前结束返回已读部分），相机掉线/USB 短包/WiFi 中断/相机休眠都会
+      // 产出一个「成功」的短文件。不校验的话：坏图 → 写进相册 → 标记已完成
+      // → 上传网盘，而「上传后删除本地副本」会把干净的那份也删掉。
+      final expected = reportedTotal > 0 ? reportedTotal : info.size;
+      final sizeError = downloadIntegrityError(
+        received: received,
+        expected: expected,
+      );
+      if (sizeError != null) throw DownloadFailure(sizeError);
+      if (expected > 0 && received > expected) {
+        // 只记不拦：多收说明 size 字段不准，但内容通常是完整的
+        debugPrint(
+          '拉取 ${info.filename}: 收到 $received > 期望 $expected，size 字段可能不准',
+        );
+      }
+
       // 本地保存：可选存入系统相册（按拍摄日期分文件夹，设置页开关）。
       // 关闭「保存到相册」时改存 Download/AkihanaMiao——不污染相册时间线，
       // 但「已拉取」面板照样能扫到（面板只认这三个专属目录，见 Gallery.query）。
       // 早前版本落应用私有目录，saveToGallery=false 时文件用户完全看不到。
+      final String? mediaUri;
       if (AppConfig.instance.saveToGallery) {
         final date = info.captureDate ?? DateTime.now();
-        final sub = AppConfig.instance.dateFolders
-            ? '${date.year.toString().padLeft(4, '0')}-'
-                  '${date.month.toString().padLeft(2, '0')}-'
-                  '${date.day.toString().padLeft(2, '0')}'
-            : null;
-        await Gallery.save(
+        final sub = AppConfig.instance.dateFolders ? _dateSub(date) : null;
+        mediaUri = await Gallery.save(
           target.path,
           target.uri.pathSegments.last,
           subFolder: sub,
         );
       } else {
-        await Gallery.save(
+        mediaUri = await Gallery.save(
           target.path,
           target.uri.pathSegments.last,
           forceDownload: true,
           subFolder: AppConfig.instance.dateFolders
               ? _dateSub(info.captureDate ?? DateTime.now())
               : null,
+        );
+      }
+      // 落盘失败（存储满 / MediaStore 拒绝）：此前返回值被丢弃，用户全程无感，
+      // 任务还标记「已完成」。这里按失败上报，但**保留已下好的文件**——
+      // 数据是好的，只是没进到用户可见的位置，删了才是真丢。
+      if (mediaUri == null) {
+        throw const DownloadFailure(
+          '文件已下载但保存到相册/下载目录失败（存储空间不足？）',
+          keepFile: true,
         );
       }
 
@@ -837,54 +899,60 @@ class CameraHub extends ChangeNotifier {
       localFilePaths[info.filename] = target.path;
       localFilePaths[target.uri.pathSegments.last] = target.path;
 
-      // 再按策略决定是否上传（上传的是本地副本）
+      // 再按策略决定是否上传（上传的是本地副本）。带上相册 uri：
+      // 上传成功后「删除本地副本」要连用户可见的那份一起删
       if (AppConfig.instance.uploadMode != AppConfig.modeLocalOnly) {
-        UploadQueue.instance.enqueue([target]);
+        UploadQueue.instance.enqueue([
+          target,
+        ], mediaUris: {target.path: mediaUri});
       }
       // 先让「已拉取」刷新，最后才把任务移出「正在拉取」——保证两页同步无缝
       LocalLibrary.instance.notifyChanged();
       PullManager.instance.finish(job);
+      return true;
     } catch (e) {
+      final t = target;
       // 取消不是故障：相机已经断开，链路死亡的判定与提示已由断开路径发出，
       // 这里只需清理半成品，不该再弹错误或把失败原因写进状态栏
       if (e is DownloadCancelled) {
         debugPrint('拉取中止 ${info.filename}: $e');
-        try {
-          final t = target;
-          if (t != null && t.existsSync()) t.deleteSync();
-        } catch (_) {}
+        _deleteQuietly(t);
         PullManager.instance.fail(job, e.toString());
-        return;
+        return false;
       }
       debugPrint('拉取失败 ${info.filename}: $e');
-      // 清理下载失败的半成品文件（避免 0 字节残留）
-      try {
-        final t = target;
-        if (t != null && t.existsSync()) t.deleteSync();
-      } catch (_) {}
+      // 清理半成品（截断文件、0 字节残留）。keepFile 的失败类型保留文件
+      if (!(e is DownloadFailure && e.keepFile)) _deleteQuietly(t);
       PullManager.instance.fail(job, e.toString());
-      // 读超时 = 相机不响应（如 GetPartialObject 挂起）：链路标记死亡，
-      // 提示重连——与事件流 onDone 同一处理
-      final msg = e.toString();
-      if (msg.contains('超时') || msg.contains('bulkRead')) {
-        _eventSub?.cancel();
-        _keepAlive?.cancel();
-        _pollTimer?.cancel();
-        final dead = session;
-        session = null;
-        _activeDriver = null;
-        _clearPullQueues();
-        disconnectNote = '相机无响应，连接已断开，请重新连接';
-        if (dead != null) {
-          unawaited(
-            dead.close().catchError((Object e) => debugPrint('关闭会话异常: $e')),
-          );
-        }
-        notifyListeners();
-        KeepAliveSync.sync();
-      }
-      rethrow;
+      // 链路故障（超时/拔出）也走统一清理：提示重连 + 解开 WiFi 网络绑定
+      if (_isLinkFailure(e)) _linkLost('相机无响应，连接已断开，请重新连接');
+      return false;
     }
+  }
+
+  static void _deleteQuietly(File? f) {
+    try {
+      if (f != null && f.existsSync()) f.deleteSync();
+    } catch (_) {}
+  }
+
+  /// 下载完整性判定。返回 null = 通过，否则返回失败原因（供 UI 展示）。
+  ///
+  /// 抽成纯函数是为了能单测——这是本项目最严重的数据风险点，
+  /// 而它所在的 _downloadJob 需要真机/平台通道才能跑。
+  ///
+  /// [expected] 优先取下载过程中后端报告的真实总长，拿不到时回落到列表里的
+  /// size（为 0 表示未知，此时只拦「一个字节都没收到」）。
+  static String? downloadIntegrityError({
+    required int received,
+    required int expected,
+  }) {
+    if (received == 0) return '未收到任何数据（相机未返回对象内容）';
+    if (expected > 0 && received < expected) {
+      return '数据不完整：收到 $received / 期望 $expected 字节'
+          '（相机中断或链路不稳）';
+    }
+    return null;
   }
 
   /// yyyy-MM-dd 子目录名（相册/下载目录通用）
@@ -932,6 +1000,9 @@ class CameraHub extends ChangeNotifier {
     if (s != null) {
       unawaited(s.close().catchError((Object e) => debugPrint('关闭会话异常: $e')));
     }
+    // WiFi 连接时整个进程被绑在相机热点上（无互联网）：断开必须解开，
+    // 否则「立即上传」档不走 gate 的解绑分支，网盘请求永远出不去
+    if (connKind == 'wifi') unawaited(NetBinder.unbind());
     KeepAliveSync.sync(); // 无上传任务则停保活
   }
 
@@ -950,26 +1021,38 @@ class CameraHub extends ChangeNotifier {
 
   /// 缩略图三级策略见 CameraAlbumPage._buildThumb：
   /// 相机缓存 → 本地回填 → 视口范围内向相机请求
-  Future<Uint8List?> fetchThumb(int handle) async {
-    // 下载让路：拉图进行中挂起缩略图请求（最多等 30s）
-    var waited = 0;
-    while (busy && waited < 30000) {
-      await Future<void>.delayed(const Duration(milliseconds: 300));
-      waited += 300;
-    }
+  ///
+  /// 门禁与保活事务保持一致：**下载进行中（busy）直接让路，不排队**。
+  /// 原实现是「忙等最多 30s 再照发」——大 RAW 分块下载必然超过 30s，
+  /// 之后视口里每个图块都会往串行队列插一条命令，正是注释里写明的
+  /// 「数据阶段中途插命令会让相机复位掉线」的高危模式。
+  /// 让路的代价只是占位图多显示一会儿：busy 翻回 false 会通知重建。
+  Future<Uint8List?> thumbFuture(int handle) {
+    final cached = thumbs[handle];
+    if (cached != null) return Future.value(cached);
+    if (busy || batchRunning) return Future.value(null);
+    if (session == null) return Future.value(null);
+    return _thumbFutures.putIfAbsent(handle, () => _fetchThumb(handle));
+  }
+
+  Future<Uint8List?> _fetchThumb(int handle) async {
+    final s = session;
+    if (s == null) return null;
     try {
-      final t = await session?.thumb(handle);
-      if (t == null) return null;
+      final t = await s.thumb(handle);
+      if (t.isEmpty) return null;
       thumbs[handle] = t;
       notifyListeners();
       return t;
-    } catch (_) {
+    } catch (e) {
+      debugPrint('缩略图 $handle 获取失败: $e');
       return null;
+    } finally {
+      // 失败/空结果不缓存：此前失败的 Future 永久留在表里，
+      // 那张图的缩略图到断开为止都不会再重试
+      if (thumbs[handle] == null) _thumbFutures.remove(handle);
     }
   }
-
-  Future<Uint8List?> thumbFuture(int handle) =>
-      _thumbFutures.putIfAbsent(handle, () => fetchThumb(handle));
 
   void toggleSelect(int handle) {
     selectedHandles.contains(handle)

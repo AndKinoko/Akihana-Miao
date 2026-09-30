@@ -129,7 +129,7 @@ class WifiLink implements PtpLink {
       try {
         event?.destroy();
       } catch (_) {}
-      throw PtpException('连接相机失败: ${e.message}');
+      throw PtpException('连接相机失败: ${e.message}', kind: PtpFailureKind.linkLost);
     } on PtpException {
       // 握手超时/InitFail 等 PtpException 同样必须清理，
       // 否则半开 socket 占住相机（单客户端限制），下次连接被拒
@@ -155,7 +155,7 @@ class WifiLink implements PtpLink {
     return ack.future.timeout(
       timeout,
       onTimeout: () {
-        throw const PtpException('InitCommandRequest 握手超时');
+        throw const PtpException('InitCommandRequest 握手超时', kind: PtpFailureKind.timeout);
       },
     );
   }
@@ -167,7 +167,7 @@ class WifiLink implements PtpLink {
     await c.future.timeout(
       timeout,
       onTimeout: () {
-        throw const PtpException('InitEventRequest 握手超时（事件连接未确认）');
+        throw const PtpException('InitEventRequest 握手超时（事件连接未确认）', kind: PtpFailureKind.timeout);
       },
     );
   }
@@ -385,17 +385,23 @@ class WifiLink implements PtpLink {
     _timeoutTimer?.cancel();
     final p = _pending;
     if (p != null && !p.isCompleted) {
-      p.completeError(PtpException('连接已断开: $reason'));
+      p.completeError(
+        PtpException('连接已断开: $reason', kind: PtpFailureKind.linkLost),
+      );
       _pending = null;
     }
     // 握手期的 completer 也要完成，否则 connect() 要等满超时才失败
     final ia = _initAck;
     if (ia != null && !ia.isCompleted) {
-      ia.completeError(PtpException('连接已断开: $reason'));
+      ia.completeError(
+        PtpException('连接已断开: $reason', kind: PtpFailureKind.linkLost),
+      );
     }
     final ea = _eventAck;
     if (ea != null && !ea.isCompleted) {
-      ea.completeError(PtpException('连接已断开: $reason'));
+      ea.completeError(
+        PtpException('连接已断开: $reason', kind: PtpFailureKind.linkLost),
+      );
     }
     if (!_events.isClosed) _events.close();
     _destroy();
@@ -437,7 +443,9 @@ class WifiLink implements PtpLink {
     Duration timeout,
     void Function(int received)? onData,
   ) async {
-    if (_dead || _cmd == null) throw const PtpException('PTP/IP 连接已断开');
+    if (_dead || _cmd == null) {
+      throw const PtpException('PTP/IP 连接已断开', kind: PtpFailureKind.linkLost);
+    }
     final tid = ++_tid;
     final c = Completer<List<int>>();
     _pending = c;
@@ -451,7 +459,10 @@ class WifiLink implements PtpLink {
         _pendingOnData = null;
         if (!c.isCompleted) {
           c.completeError(
-            PtpException('操作 0x${code.toRadixString(16)} 超时（$_host）'),
+            PtpException(
+              '操作 0x${code.toRadixString(16)} 超时（$_host）',
+              kind: PtpFailureKind.timeout,
+            ),
           );
         }
         // 关键：超时意味着响应流可能残留（数据阶段半途而废），

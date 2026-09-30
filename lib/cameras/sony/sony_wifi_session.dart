@@ -166,8 +166,87 @@ class SonyWifiSession extends CameraSession {
     return _contents.keys.toList();
   }
 
+  /// 两次全量递归扫描的最小间隔。
+  ///
+  /// 索尼协议没有事件接口，新图只能靠轮询发现——但「逐个日期目录递归 +
+  /// 分页」是重活：30 个目录就是每轮 30+ 次 SOAP 往返，4 秒一轮全天候空转。
+  /// 策略见 [listObjectHandles]：根层指纹变了立刻重扫，指纹看不出来的变化
+  /// （往已有日期目录里新增）由这个周期兜底，**任何情况下都不会漏检**，
+  /// 最坏只是晚 15 秒发现。
+  static const _minRescanInterval = Duration(seconds: 15);
+  DateTime _lastRescan = DateTime.fromMillisecondsSinceEpoch(0);
+  String? _rootFp;
+
   @override
-  Future<List<int>> listObjectHandles() => _refreshContents();
+  Future<List<int>> listObjectHandles() async {
+    if (_contents.isEmpty) {
+      // 首次（连接时）：直接全量扫描，扫完取一次根层指纹存起来
+      final handles = await _refreshContents();
+      _lastRescan = DateTime.now();
+      _rootFp = await _probeRootFingerprint();
+      return handles;
+    }
+    // 根层指纹：1 次请求换取「要不要提前重扫」的判断
+    final fp = await _probeRootFingerprint();
+    final changed = fp != _rootFp;
+    final sinceLast = DateTime.now().difference(_lastRescan);
+    // 指纹变了 → 内容一定变了，不必等周期，立刻重扫；
+    // 指纹没变 → 至少按 _minRescanInterval 的周期重扫一次。
+    //
+    // 关键：**指纹只用来「加速」，绝不能用来「跳过」**。根层指纹看不到容器
+    // 内部的新增（往 2026-09-11 这个目录里再拍一张，根层的条数/子目录集合
+    // 都不变），若写成「指纹没变就直接复用缓存」，新图永远不会被发现。
+    if (!changed && sinceLast < _minRescanInterval) {
+      return _contents.keys.toList();
+    }
+    _lastRescan = DateTime.now();
+    final handles = await _refreshContents();
+    _rootFp = fp;
+    return handles;
+  }
+
+  /// 根层指纹：直接子对象的条数 + 各子容器 id。
+  ///
+  /// 目录增删、总条数变化都能识别（这类变化意味着内容一定变了）；
+  /// 「往已有日期目录里新增一张」不会体现在根层，交由节流兜底。
+  /// 网络/协议错误照常抛出，链路的掉线感知依赖它。
+  Future<String?> _probeRootFingerprint() async {
+    final resp = await _soap(
+      '/upnp/control/ContentDirectory',
+      'urn:schemas-upnp-org:service:ContentDirectory:1',
+      'Browse',
+      '<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">'
+          '<ObjectID>$_root</ObjectID>'
+          '<BrowseFlag>BrowseDirectChildren</BrowseFlag>'
+          '<Filter>*</Filter>'
+          '<StartingIndex>0</StartingIndex>'
+          '<RequestedCount>9999</RequestedCount>'
+          '<SortCriteria></SortCriteria>'
+          '</u:Browse>',
+    );
+    if (resp.statusCode != 200) {
+      throw PtpException('读取内容列表失败 (${resp.statusCode})');
+    }
+    final doc = XmlDocument.parse(resp.body);
+    final total =
+        doc.findAllElements('TotalMatches').firstOrNull?.innerText ?? '';
+    final resultText = doc.findAllElements('Result').firstOrNull?.innerText;
+    final ids = <String>[];
+    var items = 0;
+    if (resultText != null && resultText.isNotEmpty) {
+      try {
+        final didl = XmlDocument.parse(resultText);
+        for (final c in didl.findAllElements('container')) {
+          ids.add(c.getAttribute('id') ?? '');
+        }
+        items = didl.findAllElements('item').length;
+      } catch (_) {
+        /* DIDL 解析失败：指纹退化，下一轮照常全量扫描 */
+      }
+    }
+    ids.sort();
+    return '$total|$items|${ids.join(",")}';
+  }
 
   @override
   Future<PtpObjectInfo> getObjectInfo(int handle) async {

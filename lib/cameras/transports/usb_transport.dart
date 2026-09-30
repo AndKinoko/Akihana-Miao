@@ -36,10 +36,21 @@ class UsbTransport implements PtpTransport {
 
   @override
   Future<void> write(List<int> data) async {
-    if (_closed) throw const PtpException('USB 已关闭');
-    await _channel.invokeMethod('bulkWrite', {
-      'data': Uint8List.fromList(data),
-    });
+    if (_closed) {
+      throw const PtpException('USB 已关闭', kind: PtpFailureKind.linkLost);
+    }
+    try {
+      await _channel.invokeMethod('bulkWrite', {
+        'data': Uint8List.fromList(data),
+      });
+    } on PlatformException catch (e) {
+      // 平台异常必须在这里翻译成协议层异常：上层靠 PtpFailureKind 判定掉线，
+      // 漏出 PlatformException 会让「拔线」被当成普通协议错误
+      throw PtpException(
+        'USB 写入失败：${e.message ?? e.code}',
+        kind: PtpFailureKind.linkLost,
+      );
+    }
   }
 
   @override
@@ -47,12 +58,23 @@ class UsbTransport implements PtpTransport {
     int length, {
     Duration timeout = const Duration(seconds: 30),
   }) async {
-    if (_closed) throw const PtpException('USB 已关闭');
-    final data = await _channel.invokeMethod<List<int>>('bulkRead', {
-      'length': length,
-      'timeout': timeout.inMilliseconds,
-    });
-    return Uint8List.fromList(data ?? const []);
+    if (_closed) {
+      throw const PtpException('USB 已关闭', kind: PtpFailureKind.linkLost);
+    }
+    try {
+      final data = await _channel.invokeMethod<List<int>>('bulkRead', {
+        'length': length,
+        'timeout': timeout.inMilliseconds,
+      });
+      return Uint8List.fromList(data ?? const []);
+    } on PlatformException catch (e) {
+      // Kotlin 侧 bulkRead 超时/拔出统一报 "bulkRead 失败（超时/断开）"，
+      // 这里归类为链路失联（原实现靠匹配这个中文字符串，文案一改即失效）
+      throw PtpException(
+        'USB 读取失败：${e.message ?? e.code}',
+        kind: PtpFailureKind.linkLost,
+      );
+    }
   }
 
   @override

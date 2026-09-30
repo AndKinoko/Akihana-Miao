@@ -237,6 +237,14 @@ class CanonWifiSession extends CameraSession {
     throw PtpException('缩略图获取失败');
   }
 
+  /// 差集兜底的两次全量扫描最小间隔。
+  ///
+  /// event/polling 不可用的机型只能靠 listObjectHandles() 全量差集——
+  /// 那是「存储卡 → 目录 → 分页」的整树遍历，4 秒一轮等于持续满负荷
+  /// 扫描相机。节流到 15 秒：新图最多晚 15 秒发现，代价可接受。
+  static const _minFallbackScanInterval = Duration(seconds: 15);
+  DateTime _lastFallbackScan = DateTime.fromMillisecondsSinceEpoch(0);
+
   /// 新对象事件：CCAPI event/polling 的 addedcontents/removedcontents；
   /// 机型不支持（404 等）时退回全量列表差集，语义与句柄轮询一致
   @override
@@ -272,7 +280,14 @@ class CanonWifiSession extends CameraSession {
         }
       }
     }
-    // 兜底：全量差集（新增 + 删除），语义与 hub 的句柄轮询一致
+    // 兜底：全量差集（新增 + 删除），语义与 hub 的句柄轮询一致。
+    // 整树遍历很贵，按 _minFallbackScanInterval 节流
+    if (_contents.isNotEmpty &&
+        DateTime.now().difference(_lastFallbackScan) <
+            _minFallbackScanInterval) {
+      return const [];
+    }
+    _lastFallbackScan = DateTime.now();
     final before = _contents.keys.toSet();
     final handles = await listObjectHandles();
     final after = handles.toSet();

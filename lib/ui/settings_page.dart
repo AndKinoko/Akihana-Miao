@@ -185,10 +185,14 @@ class UploadStrategyPage extends StatefulWidget {
   State<UploadStrategyPage> createState() => _UploadStrategyPageState();
 }
 
-class _UploadStrategyPageState extends State<UploadStrategyPage> {
+/// 二级页必须自己订阅配置：只在 build 里读 AppConfig 的 State 不会自动重建，
+/// 改动能存进去、单选/开关却停在旧值（要退出再进才刷新）。
+class _UploadStrategyPageState extends State<UploadStrategyPage>
+    with ConfigListener<UploadStrategyPage> {
   Future<void> _setMode(int mode) async {
     AppConfig.instance.uploadMode = mode;
     await AppConfig.instance.save();
+    // 上传策略变了要重新判定门禁（WiFi 档 ↔ 立即上传）
     UploadQueue.instance.kick();
   }
 
@@ -240,7 +244,8 @@ class PullStrategyPage extends StatefulWidget {
   State<PullStrategyPage> createState() => _PullStrategyPageState();
 }
 
-class _PullStrategyPageState extends State<PullStrategyPage> {
+class _PullStrategyPageState extends State<PullStrategyPage>
+    with ConfigListener<PullStrategyPage> {
   @override
   Widget build(BuildContext context) {
     final cfg = AppConfig.instance;
@@ -324,7 +329,8 @@ class AlbumStoragePage extends StatefulWidget {
   State<AlbumStoragePage> createState() => _AlbumStoragePageState();
 }
 
-class _AlbumStoragePageState extends State<AlbumStoragePage> {
+class _AlbumStoragePageState extends State<AlbumStoragePage>
+    with ConfigListener<AlbumStoragePage> {
   @override
   Widget build(BuildContext context) {
     final cfg = AppConfig.instance;
@@ -455,10 +461,17 @@ class _PanServicePageState extends State<PanServicePage> {
     _url = TextEditingController(text: cfg.baseUrl);
     _user = TextEditingController(text: cfg.username);
     _pass = TextEditingController(text: cfg.password);
+    // 明文地址告警需要随输入实时更新
+    _url.addListener(_onUrlChanged);
+  }
+
+  void _onUrlChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
+    _url.removeListener(_onUrlChanged);
     _url.dispose();
     _user.dispose();
     _pass.dispose();
@@ -582,6 +595,34 @@ class _PanServicePageState extends State<PanServicePage> {
                 hintText: 'http://localhost:100（真机请填 PC 局域网 IP）',
               ),
             ),
+            // 明文 HTTP 是必需能力（相机协议本身没有 TLS，网盘地址又由用户
+            // 填写、无法做域名白名单），但必须让用户知道自己正在明文传输凭据
+            if (_url.text.trim().toLowerCase().startsWith('http://'))
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(
+                      Icons.warning_amber_rounded,
+                      size: 15,
+                      color: cs.error,
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        '明文传输：账号、密码与登录令牌会以明文经过网络，'
+                        '同一网络下的他人可以截获。自建服务支持 HTTPS 时请填 https://',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          height: 1.4,
+                          color: cs.error,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             const SizedBox(height: 10),
             TextField(
               controller: _user,

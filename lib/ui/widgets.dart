@@ -4,9 +4,37 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 
 import '../cameras/camera_hub.dart';
+import '../core/config.dart';
 import 'theme.dart';
 
 /// iOS 风格组件库（对照 demo index.html 的 .card/.lrow/.chip/.pill/.seg/.selbar 等）
+
+/// 订阅 [AppConfig] 的 State mixin：配置任意字段变化都会重建该页。
+///
+/// 直接在 build 里读 `AppConfig.instance.xxx` 的 State **不会**自动重建。
+/// 设置页主页面早就用 ListenableBuilder 解决了，但二级页（上传策略 / 拉取策略 /
+/// 相册与存储）漏掉了：改动能存进去，界面却停在旧值，要退出再进才刷新。
+///
+/// 另一处同类陷阱是 const 规范化：`const _BrandSelector()` 这种写法会让父级
+/// 重建时命中框架的 `child.widget == newWidget` 短路，整棵子树都不重建——
+/// 靠本 mixin 自己注册的监听才能绕开。
+mixin ConfigListener<T extends StatefulWidget> on State<T> {
+  @override
+  void initState() {
+    super.initState();
+    AppConfig.instance.addListener(_onConfigChanged);
+  }
+
+  void _onConfigChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    AppConfig.instance.removeListener(_onConfigChanged);
+    super.dispose();
+  }
+}
 
 /// 大标题页头
 class PageHeader extends StatelessWidget {
@@ -117,7 +145,7 @@ class GroupList extends StatelessWidget {
 }
 
 /// 分组列表行（.lrow）：leading 图标 + 标题/副标题 + trailing
-class ListRow extends StatelessWidget {
+class ListRow extends StatefulWidget {
   const ListRow({
     super.key,
     this.icon,
@@ -134,8 +162,27 @@ class ListRow extends StatelessWidget {
   final Widget? trailing;
   final VoidCallback? onTap;
 
-  /// 防抖：同一行 300ms 内的重复点击只算一次
-  static DateTime _lastTap = DateTime.fromMillisecondsSinceEpoch(0);
+  @override
+  State<ListRow> createState() => _ListRowState();
+}
+
+class _ListRowState extends State<ListRow> {
+  /// 防抖：同一行 300ms 内的重复点击只算一次。
+  ///
+  /// 必须是**每行实例**的状态。此前它是 `static`，全应用共享同一个时间戳：
+  /// 点完 A 行后 300ms 内点 B 行会被静默吞掉，表现为「点了没反应」——
+  /// 相机品牌选择里连续点两个选项时尤其明显，看上去像是选不上。
+  DateTime _lastTap = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 延迟执行的动作；页面在延迟期间被销毁时要撤掉，否则会对已卸载的
+  /// 上下文执行跳转（bottom sheet 选完即关，正好落在这个窗口里）
+  Timer? _pending;
+
+  @override
+  void dispose() {
+    _pending?.cancel();
+    super.dispose();
+  }
 
   Future<void> _handleTap() async {
     final now = DateTime.now();
@@ -143,15 +190,19 @@ class ListRow extends StatelessWidget {
     _lastTap = now;
     // 先让点击高亮（水波纹）播完再执行动作，
     // 否则页面立即跳转、动画却留在原地播放（脱节）
-    await Future<void>.delayed(const Duration(milliseconds: 150));
-    onTap!();
+    _pending?.cancel();
+    _pending = Timer(const Duration(milliseconds: 150), () {
+      if (!mounted) return;
+      widget.onTap?.call();
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final icon = widget.icon;
     return InkWell(
-      onTap: onTap == null ? null : _handleTap,
+      onTap: widget.onTap == null ? null : _handleTap,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
         child: Row(
@@ -161,10 +212,14 @@ class ListRow extends StatelessWidget {
                 width: 30,
                 height: 30,
                 decoration: BoxDecoration(
-                  color: (iconColor ?? cs.primary).withValues(alpha: 0.15),
+                  color: (widget.iconColor ?? cs.primary).withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: Icon(icon, size: 17, color: iconColor ?? cs.primary),
+                child: Icon(
+                  icon,
+                  size: 17,
+                  color: widget.iconColor ?? cs.primary,
+                ),
               ),
               const SizedBox(width: 14),
             ],
@@ -172,18 +227,18 @@ class ListRow extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  if (title != null)
+                  if (widget.title != null)
                     Text(
-                      title!,
+                      widget.title!,
                       style: const TextStyle(
                         fontSize: 14,
                         fontWeight: FontWeight.w500,
                       ),
                     ),
-                  if (subtitle != null) ...[
+                  if (widget.subtitle != null) ...[
                     const SizedBox(height: 2),
                     Text(
-                      subtitle!,
+                      widget.subtitle!,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
@@ -195,7 +250,10 @@ class ListRow extends StatelessWidget {
                 ],
               ),
             ),
-            if (trailing != null) ...[const SizedBox(width: 8), trailing!],
+            if (widget.trailing != null) ...[
+              const SizedBox(width: 8),
+              widget.trailing!,
+            ],
           ],
         ),
       ),

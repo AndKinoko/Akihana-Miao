@@ -39,6 +39,43 @@ class PtpLog {
   }
 }
 
+/// 失败类型：链路故障判定必须靠它，**不能靠异常文案**。
+///
+/// 早前 CameraHub 用 `msg.contains('超时') || msg.contains('bulkRead')` 判断
+/// 设备掉线——协议层或 Kotlin 侧改一个字，掉线检测就静默失效。抛异常时
+/// 一律带上 kind，上层只认枚举。
+enum PtpFailureKind {
+  /// 协议/业务错误（响应码非 0x2001、参数非法）：链路还活着，重试有意义
+  protocol,
+
+  /// 超时：对端没在时限内回包。整链路必须作废（PTP 事务超时后响应流会残留，
+  /// 复用会污染下一事务的组包边界），但对上层语义是「可能还能重连」
+  timeout,
+
+  /// 链路已断：设备拔出、socket 关闭、USB bulk 读写失败
+  linkLost,
+}
+
+class PtpException implements Exception {
+  const PtpException(
+    this.message, {
+    this.code,
+    this.kind = PtpFailureKind.protocol,
+  });
+
+  final String message;
+  final int? code;
+  final PtpFailureKind kind;
+
+  /// 是否属于「链路不可用」——上层据此判定掉线、提示重连
+  bool get isLinkFailure =>
+      kind == PtpFailureKind.timeout || kind == PtpFailureKind.linkLost;
+
+  @override
+  String toString() =>
+      code == null ? message : '$message (0x${code!.toRadixString(16)})';
+}
+
 /// PTP（PIMA 15740）常量与字节编解码工具
 class Ptp {
   // ---------- USB 容器类型 ----------
@@ -115,8 +152,14 @@ class Ptp {
     return b.buffer.asUint8List();
   }
 
-  /// 解析响应/事件容器：{code, tid, params}
+  /// 解析响应/事件容器：{code, tid, params}。
+  ///
+  /// 防御性解析：畸形/截断响应必须抛 [PtpException]，不能漏出 `RangeError`——
+  /// 后者文案里没有「超时/断开」语义，掉线判定会误判成普通失败。
   static PtpContainer parseContainer(Uint8List raw) {
+    if (raw.length < 12) {
+      throw PtpException('PTP 容器过短（${raw.length} 字节 < 12）');
+    }
     final b = ByteData.sublistView(raw);
     final type = b.getUint16(4, Endian.little);
     final code = b.getUint16(6, Endian.little);
@@ -124,7 +167,9 @@ class Ptp {
     final len = b.getUint32(0, Endian.little);
     final params = <int>[];
     if (type == containerResponse || type == containerEvent) {
-      for (var off = 12; off + 4 <= len && off + 4 <= raw.length; off += 4) {
+      // 双上界：容器自报长度 ≤ 实际字节数，两者取小后仍要求至少剩 4 字节
+      final end = len < raw.length ? len : raw.length;
+      for (var off = 12; off + 4 <= end; off += 4) {
         params.add(b.getUint32(off, Endian.little));
       }
     }
@@ -134,39 +179,57 @@ class Ptp {
   /// PTP 字符串解码：u8 字符数（含结尾 \u0000，按 u16 计），其后为 UTF-16LE。
   /// 返回 (字符串, 消费后的新偏移)。
   static (String, int) readString(Uint8List data, int offset) {
+    if (offset < 0 || offset >= data.length) {
+      throw PtpException('PTP 字符串越界（offset=$offset / ${data.length}）');
+    }
     final b = ByteData.sublistView(data);
     final count = b.getUint8(offset);
     if (count == 0) return ('', offset + 1);
+    // 先验证整串在缓冲区内，再逐字符读——count 字段说谎时不至于读到一半才炸
+    final end = offset + 1 + count * 2;
+    if (end > data.length) {
+      throw PtpException(
+        'PTP 字符串长度越界（需 $end / 实际 ${data.length}，count=$count）',
+      );
+    }
     final sb = StringBuffer();
     for (var i = 0; i < count - 1; i++) {
       sb.writeCharCode(b.getUint16(offset + 1 + i * 2, Endian.little));
     }
-    return (sb.toString(), offset + 1 + count * 2);
+    return (sb.toString(), end);
   }
 
   /// PTP 字符串解码（不需要偏移推进时使用）
   static String parseString(Uint8List data, int offset) =>
       readString(data, offset).$1;
 
-  /// u32 数组解码：u32 个数 + n 个 u32
-  static List<int> parseU32Array(Uint8List data, int offset) {
-    final b = ByteData.sublistView(data);
-    final n = b.getUint32(offset, Endian.little);
-    return [
-      for (var i = 0; i < n; i++)
-        b.getUint32(offset + 4 + i * 4, Endian.little),
-    ];
+  /// 校验「u32 个数 + n 个 u32」这段在缓冲区内，返回元素个数
+  static int _checkArray(Uint8List data, int offset, String what) {
+    if (offset < 0 || offset + 4 > data.length) {
+      throw PtpException('$what 计数越界（offset=$offset / ${data.length}）');
+    }
+    final n = ByteData.sublistView(data).getUint32(offset, Endian.little);
+    if (offset + 4 + n * 4 > data.length) {
+      throw PtpException('$what 长度越界（声明 $n 项 / 实际 ${data.length} 字节）');
+    }
+    return n;
   }
+
+  /// u32 数组解码：u32 个数 + n 个 u32
+  static List<int> parseU32Array(Uint8List data, int offset) =>
+      readU32Array(data, offset).$1;
 
   /// u32 数组解码并返回消费后的新偏移
   static (List<int>, int) readU32Array(Uint8List data, int offset) {
+    final n = _checkArray(data, offset, 'PTP u32 数组');
     final b = ByteData.sublistView(data);
-    final n = b.getUint32(offset, Endian.little);
-    final list = [
-      for (var i = 0; i < n; i++)
-        b.getUint32(offset + 4 + i * 4, Endian.little),
-    ];
-    return (list, offset + 4 + n * 4);
+    return (
+      [
+        for (var i = 0; i < n; i++)
+          b.getUint32(offset + 4 + i * 4, Endian.little),
+      ],
+      offset + 4 + n * 4,
+    );
   }
 }
 
@@ -206,6 +269,9 @@ class PtpDeviceInfo {
     // DeviceInfo 数据集（PIMA 15740）：
     // StandardVersion u16 + VendorExtensionID u32 = 6 字节，
     // 之后紧跟 VendorExtensionDesc 字符串（不是定长 u16！之前错跳 8 字节导致全盘错位）
+    if (d.length < 8) {
+      throw PtpException('DeviceInfo 过短（${d.length} 字节）');
+    }
     var off = 6;
     final desc = Ptp.readString(d, off); // VendorExtensionDesc
     off = desc.$2;
@@ -257,6 +323,11 @@ class PtpObjectInfo {
   }
 
   static PtpObjectInfo parse(Uint8List d) {
+    // 定长头 52 字节（parentObject 在 [44,48)）。截断响应在此拦下，
+    // 而不是让 getUint32/getUint16 抛 RangeError（见容器解析处的同类说明）
+    if (d.length < 52) {
+      throw PtpException('ObjectInfo 过短（${d.length} 字节 < 52）');
+    }
     final b = ByteData.sublistView(d);
     final storageId = b.getUint32(0, Endian.little);
     final objectFormat = b.getUint16(4, Endian.little);

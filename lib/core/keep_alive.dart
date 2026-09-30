@@ -13,13 +13,22 @@ class KeepAliveSync {
 
   static const _channel = MethodChannel('dev.akihana/usb_host');
 
-  /// 生命周期监听：退后台/回前台时兜底同步一次（失败静默）
+  /// 生命周期监听：退后台/回前台时兜底同步一次（失败静默）。
+  ///
+  /// 除了启停前台服务，还顺带唤醒上传队列：切前后台是「环境可能已经变了」
+  /// 的信号（换了网络、插上了电源），而这正是门禁条件恢复的时机。
+  /// 此前这里只开关服务、不 kick 队列，是 gate 单向闩锁的成因之一。
   // 字段本身无读取方，存在的意义是让监听常驻整个 App 生命周期
   // ignore: unused_field
   static final AppLifecycleListener _lifecycle = AppLifecycleListener(
-    onHide: () => sync(),
-    onShow: () => sync(),
+    onHide: _onLifecycleChange,
+    onShow: _onLifecycleChange,
   );
+
+  static void _onLifecycleChange() {
+    sync();
+    UploadQueue.instance.kick();
+  }
 
   /// 通知文案按当前状态生成
   static String _text() {

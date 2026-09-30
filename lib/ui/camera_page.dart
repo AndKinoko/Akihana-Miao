@@ -134,7 +134,8 @@ class CameraPage extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const SectionHeader('相机品牌'),
-              const _BrandSelector(),
+              // 不写 const：const 规范化会让父级重建被框架短路掉
+              _BrandSelector(),
               const SizedBox(height: 10),
               const SectionHeader('连接方式'),
               GroupList(
@@ -384,7 +385,11 @@ class _BrandSelector extends StatefulWidget {
   State<_BrandSelector> createState() => _BrandSelectorState();
 }
 
-class _BrandSelectorState extends State<_BrandSelector> {
+/// 必须自己订阅 AppConfig：调用点是 `const _BrandSelector()`，const 规范化
+/// 会让父级重建时命中框架的 `child.widget == newWidget` 短路，整棵子树都不
+/// 重建 —— 于是选完品牌标签还停在旧值，看起来像「改了没用」。
+class _BrandSelectorState extends State<_BrandSelector>
+    with ConfigListener<_BrandSelector> {
   String get _value => AppConfig.instance.brandPreference;
 
   /// 品牌中文名（新品牌在此补一行即可）
@@ -450,11 +455,12 @@ class _BrandSelectorState extends State<_BrandSelector> {
                               color: cs.onSurfaceVariant,
                             ),
                       onTap: () async {
-                        Navigator.pop(ctx);
-                        if (_value == brand) return;
-                        // setter 自身会 notify，CameraPage 已在监听 AppConfig
-                        AppConfig.instance.brandPreference = brand;
-                        await AppConfig.instance.save();
+                        // 先落值再关面板：面板的关闭动画期间主页已经刷出新标签
+                        if (_value != brand) {
+                          AppConfig.instance.brandPreference = brand;
+                          await AppConfig.instance.save();
+                        }
+                        if (ctx.mounted) Navigator.pop(ctx);
                       },
                     ),
                 ],

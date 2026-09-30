@@ -40,10 +40,16 @@ migrate_working_dir/
 # Trae 本地文档（计划/审查记录，不入库）
 .trae/
 
-# 项目文档目录：内部资料，不随仓库公开
-# 包含 project/（构建流程、跨仓契约）与 history/（审计/修复/升级纪录），
-# 内含本地环境信息与内部判断，仅供本机查阅
+# 项目文档目录：内部资料，不随仓库公开。
+# 包含 project/（构建流程、跨仓契约）、history/（审计/修复/升级纪录）、
+# reference/（第三方参考实现的本地副本），内含本地环境信息与内部判断。
+#
+# 注意：.gitignore 只对**未跟踪**的文件生效。docs/ 下原本入库过几个文件，
+# 是配合 `git rm -r --cached docs` 才移出版本库的；今后新增的文件会自动被忽略。
 docs/
+
+# 单元测试：本地维护，不随仓库公开（与 docs/ 一样是「自己留着用」的部分）
+test/
 
 # Symbolication related
 app.*.symbols

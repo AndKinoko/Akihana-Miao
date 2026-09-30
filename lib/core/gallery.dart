@@ -5,24 +5,42 @@ import 'package:flutter/services.dart';
 class Gallery {
   static const MethodChannel _channel = MethodChannel('dev.akihana/usb_host');
 
-  /// 保存成功返回 true；失败/不支持返回 false（不抛异常，由调用方决定提示）。
+  /// 保存成功返回 MediaStore uri；失败/不支持返回 null（不抛异常，由调用方决定提示）。
   /// [subFolder] 可选子目录（如 yyyy-MM-dd），加在 AkihanaMiao 之后。
   /// [forceDownload] 为 true 时忽略类型，一律存 Download/AkihanaMiao——
   /// 用于「不存相册」模式：文件不进相册时间线，但仍在「已拉取」面板可见。
-  static Future<bool> save(
+  ///
+  /// 返回 uri 而不是 bool：上传成功后要按「上传后删除本地副本」把这份
+  /// 用户可见的副本一并删掉，没有 uri 就只能删应用私有目录里那份看不见的。
+  static Future<String?> save(
     String filePath,
     String fileName, {
     String? subFolder,
     bool forceDownload = false,
   }) async {
     try {
-      final uri = await _channel.invokeMethod<String>('saveToGallery', {
+      return await _channel.invokeMethod<String>('saveToGallery', {
         'path': filePath,
         'fileName': fileName,
         'subFolder': subFolder,
         'forceDownload': forceDownload,
       });
-      return uri != null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 删除相册/下载目录里的媒体文件。
+  /// [uri] 优先（saveToGallery 的返回值）；没有 uri 时用 [path] 反查
+  /// （「已拉取」面板里手动上传的文件只有路径）。返回是否删除成功。
+  static Future<bool> delete({String? uri, String? path}) async {
+    if (uri == null && path == null) return false;
+    try {
+      return await _channel.invokeMethod<bool>('deleteMedia', {
+            'uri': uri,
+            'path': path,
+          }) ??
+          false;
     } catch (_) {
       return false;
     }

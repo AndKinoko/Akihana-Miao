@@ -84,60 +84,95 @@ class PullingPanel extends StatelessWidget {
         subtitle: '连接相机后自动开始\n完成的任务直接进入系统相册「AkihanaMiao」',
       );
     }
+    final failed = jobs.where((j) => j.status == 'failed').length;
     return ListView(
       padding: const EdgeInsets.only(bottom: 24),
       children: [
-        for (final job in jobs)
-          AppCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+        // 失败项常驻显示（原实现 fail() 直接把任务移出列表，用户只看到进度条
+        // 凭空消失，既不知道失败了也不知道为什么）
+        if (failed > 0)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Row(
               children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            job.fileName,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w500,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            '${_sizeText(job.totalSize)} · 相机 → 手机相册',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: Theme.of(
-                                context,
-                              ).colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                        ],
-                      ),
+                Expanded(
+                  child: Text(
+                    '$failed 个文件拉取失败',
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      color: Theme.of(context).colorScheme.error,
                     ),
-                    if (job.isRaw) const RawBadge(),
-                    const SizedBox(width: 6),
-                    if (job.status == 'queued')
-                      const StatusChip.info('排队中')
-                    else
-                      StatusChip.info(
-                        '${(job.progress * 100).toStringAsFixed(0)}%',
-                      ),
-                  ],
+                  ),
                 ),
-                const SizedBox(height: 10),
-                ThinProgressBar(
-                  value: job.status == 'queued' ? -1 : job.progress,
+                TextButton(
+                  onPressed: PullManager.instance.clearFailed,
+                  child: const Text('清除失败项'),
                 ),
               ],
             ),
           ),
+        for (final job in jobs) _card(context, job),
       ],
+    );
+  }
+
+  Widget _card(BuildContext context, PullJob job) {
+    final isFailed = job.status == 'failed';
+    final cs = Theme.of(context).colorScheme;
+    return AppCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      job.fileName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      isFailed
+                          ? (job.error ?? '拉取失败')
+                          : '${_sizeText(job.totalSize)} · 相机 → 手机相册',
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: isFailed ? cs.error : cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (job.isRaw) const RawBadge(),
+              const SizedBox(width: 6),
+              if (isFailed)
+                TextButton(
+                  onPressed: () => PullManager.instance.dismiss(job),
+                  child: const Text('移除'),
+                )
+              else if (job.status == 'queued')
+                const StatusChip.info('排队中')
+              else
+                StatusChip.info('${(job.progress * 100).toStringAsFixed(0)}%'),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (isFailed)
+            const SizedBox.shrink()
+          else
+            ThinProgressBar(value: job.status == 'queued' ? -1 : job.progress),
+        ],
+      ),
     );
   }
 }
@@ -434,10 +469,16 @@ class UploadProgressPanel extends StatelessWidget {
     final status = switch (it.status) {
       UploadStatus.waiting => '等待中',
       UploadStatus.uploading =>
-        '上传中 ${(it.progress * 100).toStringAsFixed(0)}%',
-      UploadStatus.done =>
-        AppConfig.instance.deleteAfterUpload ? '已完成（本地已删除）' : '已完成',
-      UploadStatus.failed => '失败',
+        '上传中 ${(it.progress * 100).toStringAsFixed(0)}%'
+            '${it.retries > 0 ? '（自动重试 ${it.retries}/2）' : ''}',
+      // 删除失败的要说清楚：原实现无论如何都显示「本地已删除」，
+      // 而实际删的是用户看不见的暂存副本
+      UploadStatus.done => !AppConfig.instance.deleteAfterUpload
+          ? '已完成'
+          : (it.cleanupFailed ? '已完成（本地副本未删除）' : '已完成（本地已删除）'),
+      UploadStatus.failed => it.retries > 0
+          ? '失败（自动重试 ${it.retries} 次后）'
+          : '失败',
     };
     final err = it.error == null ? '' : ' · ${it.error}';
     return '${it.sizeText} · $status$err'.trim();

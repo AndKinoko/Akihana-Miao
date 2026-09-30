@@ -3,26 +3,22 @@ import 'dart:typed_data';
 
 import 'ptp_core.dart';
 
+/// [PtpException] / [PtpFailureKind] 定义在 ptp_core.dart（协议层最底层），
+/// 这里再导出一份，保持既有 `import 'ptp_link.dart' show PtpException` 可用
+export 'ptp_core.dart' show PtpException, PtpFailureKind;
+
 /// PTP 字节传输抽象：USB bulk 实现精确读写字节流；
 /// WiFi PTP/IP 有自己的包层（见 wifi_link.dart），不走这个接口。
 abstract class PtpTransport {
   String get name;
   Future<void> write(List<int> data);
 
-  /// 精确读取 [length] 字节；设备提前结束（短包）时返回已读部分
+  /// 精确读取 [length] 字节；设备提前结束（短包）时返回已读部分。
+  /// 链路级失败（超时/拔出/关闭）必须抛 [PtpFailureKind.linkLost]，
+  /// 不能漏出平台异常——上层靠 kind 判定掉线。
   Future<Uint8List> read(int length, {Duration timeout});
 
   Future<void> close();
-}
-
-class PtpException implements Exception {
-  const PtpException(this.message, {this.code});
-  final String message;
-  final int? code;
-
-  @override
-  String toString() =>
-      code == null ? message : '$message (0x${code!.toRadixString(16)})';
 }
 
 /// 下载被取消钩子中止（相机拔出/会话切换），非链路故障
@@ -139,7 +135,9 @@ class UsbLink implements PtpLink {
     required Duration timeout,
     void Function(int received)? onData,
   }) async {
-    if (_closed) throw const PtpException('USB 链路已关闭');
+    if (_closed) {
+      throw const PtpException('USB 链路已关闭', kind: PtpFailureKind.linkLost);
+    }
     final tid = ++_tid;
     await _transport.write(Ptp.buildCommand(code, tid, params));
     if (sendData.isNotEmpty) {

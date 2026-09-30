@@ -17,10 +17,12 @@ class PullJob {
   final Uint8List? thumb;
   final bool isRaw;
 
-  /// queued = 排队中 / pulling = 拉取中
+  /// queued = 排队中 / pulling = 拉取中 / failed = 失败（保留在列表里可见）
   String status;
   double progress = 0; // 0.0 ~ 1.0
   String? error;
+
+  bool get isActive => status == 'queued' || status == 'pulling';
 }
 
 /// 拉取任务中心：相机页发起拉取 → 这里登记 → 传输页「正在拉取」实时展示。
@@ -55,7 +57,9 @@ class PullManager extends ChangeNotifier {
 
   PullJob? _findActive(String fileName) {
     for (final j in jobs) {
-      if (j.fileName == fileName) return j;
+      // 失败项留在列表里给用户看原因，但不能算「占着这个名字」，
+      // 否则同名文件永远无法重新入队（自动拉取会被 hasActive 挡掉）
+      if (j.isActive && j.fileName == fileName) return j;
     }
     return null;
   }
@@ -89,9 +93,29 @@ class PullManager extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 失败：同样不保留历史，即时移出（错误在相机页状态栏可见）
+  /// 失败：**保留在列表里并记下原因**。
+  ///
+  /// 原实现只 notifyListeners 就把任务移出列表，错误信息无处可去——
+  /// 用户看到进度条凭空消失，不知道是成功了还是失败了。现在失败项留在
+  /// 「拉取中」面板显示红色原因，由用户点「移除」清掉。
   void fail(PullJob job, String message) {
+    job
+      ..status = 'failed'
+      ..error = message;
+    notifyListeners();
+  }
+
+  /// 用户手动移除一条失败记录
+  void dismiss(PullJob job) {
+    if (job.isActive) return;
     jobs.remove(job);
+    notifyListeners();
+  }
+
+  /// 清掉全部失败记录（相机页「清除失败项」入口用）
+  void clearFailed() {
+    if (!jobs.any((j) => j.status == 'failed')) return;
+    jobs.removeWhere((j) => j.status == 'failed');
     notifyListeners();
   }
 

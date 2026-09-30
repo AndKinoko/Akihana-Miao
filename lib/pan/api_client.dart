@@ -21,6 +21,10 @@ class PanClient {
   /// 单页条数（服务端默认 100、上限 500；这里取默认档）
   static const _listPageLimit = 100;
 
+  /// 非流式请求的超时。不设超时的话，服务端「连上了但不回包」会让上传队列
+  /// 永久卡在 ensureDateFolder 上：Future 永不完成，既不算失败也不会重试。
+  static const _requestTimeout = Duration(seconds: 15);
+
   /// 翻页上限防御：5 万条封顶，对应 500 页
   static const _maxListPages = 500;
 
@@ -57,13 +61,15 @@ class PanClient {
 
   /// GET /api/folders?parent_id={id}（省略 = 根目录）
   Future<List<Map<String, dynamic>>> listFolders({int? parentId}) async {
-    final resp = await _http.get(
-      AppConfig.instance.api(
-        '/api/folders',
-        parentId == null ? null : {'parent_id': '$parentId'},
-      ),
-      headers: _authHeaders(),
-    );
+    final resp = await _http
+        .get(
+          AppConfig.instance.api(
+            '/api/folders',
+            parentId == null ? null : {'parent_id': '$parentId'},
+          ),
+          headers: _authHeaders(),
+        )
+        .timeout(_requestTimeout);
     final data = await _unwrapOrReauth(
       resp,
       () => listFolders(parentId: parentId),
@@ -74,14 +80,22 @@ class PanClient {
 
   /// POST /api/folders { name, parent_id }（parent_id 省略 = 根目录）
   Future<int> createFolder(String name, {int? parentId}) async {
-    final body = parentId == null
-        ? '{"name":"$name"}'
-        : '{"name":"$name","parent_id":$parentId}';
-    final resp = await _http.post(
-      AppConfig.instance.api('/api/folders'),
-      headers: AppConfig.instance.jsonHeaders(token: AppConfig.instance.token),
-      body: body,
-    );
+    // 与 login() 同一教训：名字里的引号/反斜杠用字符串拼接会直接产出非法
+    // JSON（服务端 400，表现为「建目录失败」且原因难查）。日期目录今天
+    // 恰好安全，但这是公开 API，别把安全性寄托在调用方的入参上。
+    final body = jsonEncode({
+      'name': name,
+      if (parentId != null) 'parent_id': parentId,
+    });
+    final resp = await _http
+        .post(
+          AppConfig.instance.api('/api/folders'),
+          headers: AppConfig.instance.jsonHeaders(
+            token: AppConfig.instance.token,
+          ),
+          body: body,
+        )
+        .timeout(_requestTimeout);
     final data = await _unwrapOrReauth(
       resp,
       () => createFolder(name, parentId: parentId),
@@ -149,10 +163,12 @@ class PanClient {
       if (limit != null) 'limit': '$limit',
       if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
     };
-    final resp = await _http.get(
-      AppConfig.instance.api('/api/files', query.isEmpty ? null : query),
-      headers: _authHeaders(),
-    );
+    final resp = await _http
+        .get(
+          AppConfig.instance.api('/api/files', query.isEmpty ? null : query),
+          headers: _authHeaders(),
+        )
+        .timeout(_requestTimeout);
     final data = await _unwrapOrReauth(
       resp,
       () => _listFilesPage(folderId: folderId, limit: limit, cursor: cursor),
