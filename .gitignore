@@ -40,6 +40,11 @@ migrate_working_dir/
 # Trae 本地文档（计划/审查记录，不入库）
 .trae/
 
+# 项目文档目录：内部资料，不随仓库公开
+# 包含 project/（构建流程、跨仓契约）与 history/（审计/修复/升级纪录），
+# 内含本地环境信息与内部判断，仅供本机查阅
+docs/
+
 # Symbolication related
 app.*.symbols
 
