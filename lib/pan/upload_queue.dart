@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import '../cameras/camera_hub.dart';
 import '../cameras/transports/net_binder.dart';
 import '../core/battery.dart';
 import '../core/config.dart';
@@ -74,6 +75,14 @@ class UploadQueue extends ChangeNotifier {
       case AppConfig.modeWifi:
         final onWifi = await NetBinder.isOnWifi();
         if (!onWifi) return '等待 WiFi 环境';
+        // 相机热点连接时会把进程绑死在热点网络上（防止 ColorOS 智能选网
+        // 把 192.168.1.x 发给蜂窝）。网盘在公网，必须先解开绑定，
+        // 否则 isOnWifi 与网盘请求全被限制在热点里，队列永远等不到。
+        // 仅在「已连接相机热点」且「连着可上网 WiFi」时解绑：解绑后相机
+        // 断开会重新绑定，避免每次 gate 都打断相机链路。
+        if (CameraHub.instance.connected) {
+          await NetBinder.unbind();
+        }
     }
     // 条件保护（设置-拉取策略）：仅充电时上传 / 低电量暂停
     if (cfg.chargeOnly || cfg.lowBatteryPause) {

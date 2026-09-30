@@ -126,23 +126,26 @@ class PtpSession {
 
   /// 分块拉取完整对象（1MiB 块保证进度颗粒度）。
   /// 首块失败（不支持/参数无效）时自动回退 GetObject 一次性传输。
+  /// [isCancelled] 为 null 时行为与从前一致（调用方无需改动）。
   Future<Stream<List<int>>> downloadObject(
     int handle,
     int totalSize, {
     int chunk = 1024 * 1024,
     void Function(int received)? onProgress,
+    bool Function()? isCancelled,
   }) async {
     if (totalSize <= 0) {
       onProgress?.call(0);
       return Stream.value(const []);
     }
-    return _chunkedStream(handle, totalSize, onProgress);
+    return _chunkedStream(handle, totalSize, onProgress, isCancelled);
   }
 
   Stream<List<int>> _chunkedStream(
     int handle,
     int totalSize,
     void Function(int)? onProgress,
+    bool Function()? isCancelled,
   ) async* {
     var offset = 0;
     var received = 0;
@@ -151,6 +154,11 @@ class PtpSession {
     // 是进度刷新颗粒度。
     const chunk = 65536;
     while (offset < totalSize) {
+      // 每块边界检查一次：相机被拔出时，串行队列里已排队的任务会在此
+      // 立刻中止，而不是各自等到 transact 超时才失败
+      if (isCancelled?.call() == true) {
+        throw const DownloadCancelled('下载已取消（连接中断）');
+      }
       final want = (totalSize - offset) < chunk ? (totalSize - offset) : chunk;
       List<int> data;
       try {

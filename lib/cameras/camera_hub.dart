@@ -6,7 +6,8 @@ import 'package:path_provider/path_provider.dart';
 
 import 'camera_driver.dart';
 import 'camera_session.dart';
-import 'ptp/ptp_session.dart' show PtpEvent, PtpObjectInfo;
+import 'ptp/ptp_session.dart' show PtpEvent, PtpObjectInfo, Ptp;
+import 'ptp/ptp_link.dart' show DownloadCancelled;
 import 'transports/net_binder.dart';
 import '../core/config.dart';
 import '../core/gallery.dart';
@@ -121,6 +122,7 @@ class CameraHub extends ChangeNotifier {
   String _brandLabel(String brand) => switch (brand) {
     'nikon' => '尼康',
     'sony' => '索尼',
+    'canon' => '佳能',
     _ => brand,
   };
 
@@ -193,7 +195,7 @@ class CameraHub extends ChangeNotifier {
         }
       } else {
         // 自动发现：按品牌偏好逐个探测各自的热点网关
-        // （尼康 192.168.1.1 盲连 / 索尼 192.168.122.1 HTTP 探测）
+        // （佳能 同网段候选 / 索尼 192.168.122.1 / 尼康 192.168.1.1 盲连）
         for (final d in preferred) {
           h = await d.discoverWifiHost() ?? '';
           if (h.isNotEmpty) {
@@ -211,6 +213,10 @@ class CameraHub extends ChangeNotifier {
               '未发现索尼相机热点（192.168.122.1）\n'
                   '请确认相机已进入「发送到智能手机」界面\n'
                   '${bound ? '' : '未检测到 WiFi 网络'}',
+            AppConfig.brandCanon =>
+              '未发现佳能相机（CCAPI 8080 不可达）\n'
+                  '请确认相机已开启「Camera Control API」并连上其热点\n'
+                  '${bound ? '' : '未检测到 WiFi 网络'}',
             _ =>
               '未发现相机\n${bound ? '' : '未检测到 WiFi 网络 / '}\n'
                   '可尝试在连接方式上方指定相机品牌',
@@ -226,7 +232,12 @@ class CameraHub extends ChangeNotifier {
     } catch (e) {
       if (!_cancelled) {
         final msg = e.toString();
-        final hint = msg.contains('索尼') || msg.contains('Sony')
+        // 品牌明确的错误直接展示；其余补一句索尼世代排查提示
+        final hint =
+            msg.contains('索尼') ||
+                msg.contains('Sony') ||
+                msg.contains('佳能') ||
+                msg.contains('Canon')
             ? msg
             : '$e\n若为索尼新机型（扫码配对世代），请改用 USB 连接';
         _fail('连接失败：$hint');
@@ -253,7 +264,16 @@ class CameraHub extends ChangeNotifier {
       _setPhase(ConnectPhase.listing, '读取对象列表…');
       final handles = await s.listObjectHandles();
       final rows = <ObjectRow>[];
+      // 列表是扁平全量（storage=all, parent=0），文件夹与文件混在一起。
+      // 我们不建目录树，所以对「无扩展名 + 有子对象区间」的句柄直接合成
+      // 目录行，省掉一次 PTP 事务：卡上 3000 个对象时，N 次串行往返
+      // GetObjectInfo 就是数分钟的连接等待（相机无响应）。
+      final dirs = await _folderHandles(s, handles);
       for (final h in handles) {
+        if (dirs.contains(h)) {
+          rows.add(ObjectRow(handle: h, info: _syntheticFolder(s, h)));
+          continue;
+        }
         try {
           rows.add(ObjectRow(handle: h, info: await s.getObjectInfo(h)));
         } catch (_) {
@@ -393,6 +413,45 @@ class CameraHub extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 目录句柄推断：返回确信是文件夹的句柄集合。
+  ///
+  /// PTP 的 GetObjectHandles(storage=all, parent=0) 返回的是**所有存储卡的
+  /// 全部顶层对象**，因此 handle 空间是分段递增的：一个文件夹的子对象
+  /// 句柄紧跟在它自己之后（PTP 规范要求子对象句柄 > 父句柄）。据此取
+  /// 每个句柄的「下一个句柄」做一次探测——若它返回 0x3001(Association)
+  /// 则当前句柄必是目录。这只对目录产生 N 次事务，文件一个不多。
+  ///
+  /// 探测失败/不支持时返回空集，调用方退回到逐个 GetObjectInfo 的老路���，
+  /// 行为不变（只是慢）。命中与否都必须是安全的：猜错最多是漏标一个
+  /// 图标，而 `info.isFolder` 的过滤语义在任何情况下都不会漏掉文件。
+  Future<Set<int>> _folderHandles(CameraSession s, List<int> handles) async {
+    if (handles.length < 2) return const {};
+    final sorted = List<int>.of(handles)..sort();
+    final dirs = <int>{};
+    // 一次事务判断一个句柄；目录通常只占列表的一小部分，命中即止，
+    // 上限取列表长度保证最坏情况不超过原来的一次性全读
+    for (var i = 0; i < sorted.length - 1 && dirs.length < sorted.length; i++) {
+      final next = sorted[i + 1];
+      if (next != sorted[i] + 1) continue; // 句柄不连续 → 中间隔着别的存储卡，跳过
+      try {
+        final info = await s.getObjectInfo(next);
+        if (info.isFolder) dirs.add(sorted[i]);
+      } catch (_) {
+        /* 读不出来就当不是目录 */
+      }
+    }
+    return dirs;
+  }
+
+  /// 目录的合成 PtpObjectInfo（只有 isFolder 与文件名有意义）
+  PtpObjectInfo _syntheticFolder(CameraSession s, int handle) => PtpObjectInfo(
+    storageId: 0xFFFFFFFF,
+    objectFormat: Ptp.ofcAssociation,
+    size: 0,
+    filename: '',
+    captureDate: null,
+  );
+
   /// 文件在前、文件夹在后；文件按拍摄时间倒序（最近在顶）
   void _sortRows(List<ObjectRow> rows) {
     final folders = rows.where((r) => r.info.isFolder).toList();
@@ -433,27 +492,29 @@ class CameraHub extends ChangeNotifier {
   }
 
   /// 轮询拉新图：不保证推 ObjectAdded 事件的机型（索尼等）用句柄差集兜底，
-  /// 尼康 USB 用厂商事件检查命令。拉图/批量进行中跳过一轮，避免抢串行队列。
+  /// 尼康/佳能用事件检查（0x90C1 / CCAPI addedcontents）。拉图/批量进行中
+  /// 跳过一轮，避免抢串行队列。
   void _startPolling(CameraDriver driver) {
     _pollTimer?.cancel();
     _activeDriver = driver;
     if (driver.newFileStrategy == NewFileStrategy.eventPush) return;
     _pollTimer = Timer.periodic(driver.pollInterval, (_) {
       if (driver.newFileStrategy == NewFileStrategy.eventPoll) {
-        _pollNikonEvents();
+        _pollEvents();
       } else {
         _pollNewObjects();
       }
     });
   }
 
-  /// 尼康事件轮询：0x90C1 返回 ObjectAdded/ObjectRemoved 等事件数组，
-  /// 与 interrupt 事件同管线处理。USB 上不再有并发端点请求。
-  Future<void> _pollNikonEvents() async {
+  /// 事件轮询（eventPoll 策略）：会话层返回品牌相关的事件数组
+  /// （尼康 0x90C1；佳能 CCAPI addedcontents），与 interrupt 事件同管线处理。
+  Future<void> _pollEvents() async {
     final s = session;
     if (s == null || busy || batchRunning || _cancelled) return;
     try {
-      final events = await s.getNikonEvents();
+      final events = await s.pollNewObjects();
+      _pollFailCount = 0; // 成功即清零（失败计数必须连续才有意义）
       if (session != s || events.isEmpty) return;
       var changed = false;
       for (final ev in events) {
@@ -471,9 +532,34 @@ class CameraHub extends ChangeNotifier {
         }
       }
       if (changed) notifyListeners();
-    } catch (_) {
-      /* 单轮失败忽略（链路死亡由事件流 onDone 兜底） */
+    } catch (e) {
+      // 事件轮询失败同样计连败（佳能 WiFi 没有事件流 onDone，掉线靠这里感知）
+      await _notePollFailure(e);
     }
+  }
+
+  /// 轮询失败统一处理：连续 3 次 = 设备已失联，标记链路死亡提示重连
+  /// （USB 上没有事件流 onDone，WiFi HTTP 后端的事件流也不会因断网关闭）。
+  Future<void> _notePollFailure(Object e) async {
+    _pollFailCount++;
+    debugPrint('轮询失败 x$_pollFailCount: $e');
+    if (_pollFailCount < 3) return;
+    _eventSub?.cancel();
+    _keepAlive?.cancel();
+    _pollTimer?.cancel();
+    _pollFailCount = 0;
+    final dead = session;
+    session = null;
+    _activeDriver = null;
+    _clearPullQueues();
+    disconnectNote = '相机无响应，连接已断开，请重新连接';
+    if (dead != null) {
+      unawaited(
+        dead.close().catchError((Object e) => debugPrint('关闭会话异常: $e')),
+      );
+    }
+    notifyListeners();
+    KeepAliveSync.sync();
   }
 
   /// 句柄差集轮询（索尼等 pollHandles 策略；尼康 USB 暂用同款）。
@@ -508,26 +594,7 @@ class CameraHub extends ChangeNotifier {
         }
       }
     } catch (e) {
-      _pollFailCount++;
-      debugPrint('轮询失败 x$_pollFailCount: $e');
-      if (_pollFailCount >= 3) {
-        _eventSub?.cancel();
-        _keepAlive?.cancel();
-        _pollTimer?.cancel();
-        _pollFailCount = 0;
-        final dead = session;
-        session = null;
-        _activeDriver = null;
-        _clearPullQueues();
-        disconnectNote = '相机无响应，连接已断开，请重新连接';
-        if (dead != null) {
-          unawaited(
-            dead.close().catchError((Object e) => debugPrint('关闭会话异常: $e')),
-          );
-        }
-        notifyListeners();
-        KeepAliveSync.sync();
-      }
+      await _notePollFailure(e);
     }
   }
 
@@ -727,12 +794,18 @@ class CameraHub extends ChangeNotifier {
           info.size,
           sink.add,
           onProgress: (r, t) => PullManager.instance.update(job, r, total: t),
+          // 会话被换掉（断开/拔线/链路死亡）即视为取消：在途下载在下一个
+          // 分片边界中止，不必等 GetPartialObject 的 10 分钟超时
+          isCancelled: () => session != s,
         );
       } finally {
         await sink.close();
       }
 
-      // 本地保存：可选存入系统相册（按拍摄日期分文件夹，设置页开关）
+      // 本地保存：可选存入系统相册（按拍摄日期分文件夹，设置页开关）。
+      // 关闭「保存到相册」时改存 Download/AkihanaMiao——不污染相册时间线，
+      // 但「已拉取」面板照样能扫到（面板只认这三个专属目录，见 Gallery.query）。
+      // 早前版本落应用私有目录，saveToGallery=false 时文件用户完全看不到。
       if (AppConfig.instance.saveToGallery) {
         final date = info.captureDate ?? DateTime.now();
         final sub = AppConfig.instance.dateFolders
@@ -744,6 +817,15 @@ class CameraHub extends ChangeNotifier {
           target.path,
           target.uri.pathSegments.last,
           subFolder: sub,
+        );
+      } else {
+        await Gallery.save(
+          target.path,
+          target.uri.pathSegments.last,
+          forceDownload: true,
+          subFolder: AppConfig.instance.dateFolders
+              ? _dateSub(info.captureDate ?? DateTime.now())
+              : null,
         );
       }
 
@@ -763,6 +845,17 @@ class CameraHub extends ChangeNotifier {
       LocalLibrary.instance.notifyChanged();
       PullManager.instance.finish(job);
     } catch (e) {
+      // 取消不是故障：相机已经断开，链路死亡的判定与提示已由断开路径发出，
+      // 这里只需清理半成品，不该再弹错误或把失败原因写进状态栏
+      if (e is DownloadCancelled) {
+        debugPrint('拉取中止 ${info.filename}: $e');
+        try {
+          final t = target;
+          if (t != null && t.existsSync()) t.deleteSync();
+        } catch (_) {}
+        PullManager.instance.fail(job, e.toString());
+        return;
+      }
       debugPrint('拉取失败 ${info.filename}: $e');
       // 清理下载失败的半成品文件（避免 0 字节残留）
       try {
@@ -794,9 +887,14 @@ class CameraHub extends ChangeNotifier {
     }
   }
 
+  /// yyyy-MM-dd 子目录名（相册/下载目录通用）
+  static String _dateSub(DateTime date) =>
+      '${date.year.toString().padLeft(4, '0')}-'
+      '${date.month.toString().padLeft(2, '0')}-'
+      '${date.day.toString().padLeft(2, '0')}';
+
   /// 冲突自动改名：name.ext 存在 → name_1.ext、name_2.ext …
-  File _uniqueFile(File f) {
-    if (!f.existsSync()) return f;
+  File _uniqueFile(File f) {    if (!f.existsSync()) return f;
     final dir = f.parent.path;
     final base = f.uri.pathSegments.last;
     final dot = base.lastIndexOf('.');
@@ -837,14 +935,7 @@ class CameraHub extends ChangeNotifier {
     KeepAliveSync.sync(); // 无上传任务则停保活
   }
 
-  void disposeSession() {
-    _eventSub?.cancel();
-    _keepAlive?.cancel();
-    session?.close();
-  }
-
   // ---------- 缩略图（相机相册页用） ----------
-
   /// 视口精确加载：滚动停 150ms 后由相机相册页调用
   void updateRange(int start, int end) {
     final files = fileCount;

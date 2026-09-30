@@ -18,6 +18,12 @@ class PanClient {
   PanClient._();
   static final PanClient instance = PanClient._();
 
+  /// 单页条数（服务端默认 100、上限 500；这里取默认档）
+  static const _listPageLimit = 100;
+
+  /// 翻页上限防御：5 万条封顶，对应 500 页
+  static const _maxListPages = 500;
+
   final http.Client _http = http.Client();
 
   Map<String, String> _authHeaders() {
@@ -96,20 +102,72 @@ class PanClient {
     return createFolder(name);
   }
 
-  /// GET /api/files?folder_id={id}
-  Future<List<Map<String, dynamic>>> listFiles({int? folderId}) async {
+  /// GET /api/files?folder_id={id} —— **游标分页**，单页上限 100（最多 500）
+  ///
+  /// 服务端 `data` 是对象 `{files, total, has_more, next_cursor, limit}`，
+  /// 不是裸数组（早前按 `data as List` 解析，一旦调用必崩）。
+  /// [allPages] 为 true 时自动翻完所有页——调用方要的是完整列表而非某一页。
+  Future<List<Map<String, dynamic>>> listFiles({
+    int? folderId,
+    bool allPages = true,
+  }) async {
+    final out = <Map<String, dynamic>>[];
+    String? cursor;
+    // 翻页上限防御：服务端 has_more 依赖客户端正确回传 next_cursor，
+    // 一旦服务端异常返回恒 true，这里不能无限循环
+    for (var page = 0; page < _maxListPages; page++) {
+      final pageData = await _listFilesPage(
+        folderId: folderId,
+        limit: _listPageLimit,
+        cursor: cursor,
+      );
+      out.addAll(pageData.files);
+      if (!pageData.hasMore) break;
+      final next = pageData.nextCursor;
+      // 游标没推进说明服务端状态异常，停在已取到的数据上而不是空转
+      if (next == null || next.isEmpty || next == cursor) break;
+      cursor = next;
+    }
+    return out;
+  }
+
+  /// 单页拉取（保留原始分页字段，供 listFiles 翻页与调试用）
+  Future<({List<Map<String, dynamic>> files, bool hasMore, String? nextCursor})>
+  listFilesPage({int? folderId, int? limit, String? cursor}) async {
+    final data = await _listFilesPage(
+      folderId: folderId,
+      limit: limit,
+      cursor: cursor,
+    );
+    return data;
+  }
+
+  Future<({List<Map<String, dynamic>> files, bool hasMore, String? nextCursor})>
+  _listFilesPage({int? folderId, int? limit, String? cursor}) async {
+    final query = <String, String>{
+      if (folderId != null) 'folder_id': '$folderId',
+      if (limit != null) 'limit': '$limit',
+      if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
+    };
     final resp = await _http.get(
-      AppConfig.instance.api(
-        '/api/files',
-        folderId == null ? null : {'folder_id': '$folderId'},
-      ),
+      AppConfig.instance.api('/api/files', query.isEmpty ? null : query),
       headers: _authHeaders(),
     );
     final data = await _unwrapOrReauth(
       resp,
-      () => listFiles(folderId: folderId),
+      () => _listFilesPage(folderId: folderId, limit: limit, cursor: cursor),
     );
-    return (data as List? ?? const []).cast<Map<String, dynamic>>();
+    // 服务端 data = {files:[...], total, has_more, next_cursor, limit}
+    final map = data is Map ? data : const {};
+    final raw = map['files'];
+    final files = raw is List
+        ? raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList()
+        : const <Map<String, dynamic>>[];
+    return (
+      files: files,
+      hasMore: map['has_more'] == true,
+      nextCursor: map['next_cursor'] as String?,
+    );
   }
 
   /// POST /api/files/upload，流式 multipart。

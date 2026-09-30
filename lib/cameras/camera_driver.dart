@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'canon/canon_driver.dart';
 import 'nikon/nikon_driver.dart';
 import 'sony/sony_driver.dart';
 
@@ -69,8 +70,11 @@ class CameraDrivers {
   CameraDrivers._();
 
   static final List<CameraDriver> all = [
-    const NikonDriver(),
+    // 顺序 = WiFi 自动发现优先级：佳能/索尼按各自网关探测（失败即让位），
+    // 尼康是盲连（网关固定 192.168.1.1）必须放最后，否则会抢走佳能热点
+    const CanonDriver(),
     const SonyDriver(),
+    const NikonDriver(),
   ];
 
   /// 枚举指定品牌范围的 USB 相机（带品牌归属；drivers 缺省=全部品牌）

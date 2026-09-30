@@ -20,10 +20,13 @@ class TransferPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
+      // UploadQueue 的进度通知已带出当前配置文案；这里额外监听配置，
+      // 是为了让「上传后删除」等开关切换时已完成的条目立刻改写状态行
       animation: Listenable.merge([
         PullManager.instance,
         UploadQueue.instance,
         transferTabIndex,
+        AppConfig.instance,
       ]),
       builder: (context, _) {
         final idx = transferTabIndex.value;

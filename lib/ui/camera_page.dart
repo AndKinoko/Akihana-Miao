@@ -53,7 +53,9 @@ class CameraPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final hub = CameraHub.instance;
     return AnimatedBuilder(
-      animation: hub,
+      // 配置也进监听：设置页改了拉取/上传策略，这里（品牌选择、策略摘要）
+      // 无需依赖跨页 setState 就能同步刷新
+      animation: Listenable.merge([hub, AppConfig.instance]),
       builder: (context, _) {
         // 一次性断开提示（弹一次即清，绝不重复弹）
         final note = hub.disconnectNote;
@@ -389,7 +391,7 @@ class _BrandSelectorState extends State<_BrandSelector> {
   static String _brandLabel(String brand) => switch (brand) {
     AppConfig.brandNikon => '尼康',
     AppConfig.brandSony => '索尼',
-    'canon' => '佳能',
+    AppConfig.brandCanon => '佳能',
     _ => brand,
   };
 
@@ -397,6 +399,7 @@ class _BrandSelectorState extends State<_BrandSelector> {
     AppConfig.brandAuto => '所有品牌自动探测',
     AppConfig.brandNikon => 'WiFi 直连相机热点',
     AppConfig.brandSony => '发送到智能手机',
+    AppConfig.brandCanon => 'Camera Control API',
     _ => '',
   };
 
@@ -449,9 +452,8 @@ class _BrandSelectorState extends State<_BrandSelector> {
                       onTap: () async {
                         Navigator.pop(ctx);
                         if (_value == brand) return;
-                        setState(
-                          () => AppConfig.instance.brandPreference = brand,
-                        );
+                        // setter 自身会 notify，CameraPage 已在监听 AppConfig
+                        AppConfig.instance.brandPreference = brand;
                         await AppConfig.instance.save();
                       },
                     ),

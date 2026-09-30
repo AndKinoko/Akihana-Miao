@@ -6,7 +6,7 @@ import 'package:xml/xml.dart';
 
 import '../camera_session.dart';
 import '../ptp/ptp_session.dart' show PtpDeviceInfo, PtpEvent, PtpObjectInfo;
-import '../ptp/ptp_link.dart' show PtpException;
+import '../ptp/ptp_link.dart' show PtpException, DownloadCancelled;
 
 /// 索尼旧世代 WiFi 会话（PlayMemories / Imaging Edge 的「发送到智能手机」协议）。
 ///
@@ -199,6 +199,7 @@ class SonyWifiSession extends CameraSession {
     int size,
     void Function(List<int> chunk) sink, {
     void Function(int received, int total)? onProgress,
+    bool Function()? isCancelled,
   }) async {
     final c = _contents[handle];
     if (c == null) throw PtpException('对象不存在');
@@ -212,6 +213,14 @@ class SonyWifiSession extends CameraSession {
     final completer = Completer<void>();
     resp.stream.listen(
       (chunk) {
+        if (isCancelled?.call() == true) {
+          if (!completer.isCompleted) {
+            completer.completeError(
+              const DownloadCancelled('下载已取消（连接中断）'),
+            );
+          }
+          return;
+        }
         received += chunk.length;
         sink(chunk);
         onProgress?.call(received, total);

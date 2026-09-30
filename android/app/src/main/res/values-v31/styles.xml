@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 注意：style 资源不会跨配置合并，所以这里必须把 LaunchTheme 整份重复，
+     只在此基础上加 API 31+ 的系统 SplashScreen 属性。 -->
+<resources>
+    <!-- 系统为浅色时（API 31+）。windowSplashScreenBackground 不设的话，
+         系统会用主题的 colorBackground（浅色主题下即白色）作为闪屏底色。 -->
+    <style name="LaunchTheme" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">@drawable/launch_background</item>
+        <item name="android:windowSplashScreenBackground">@color/splash_background</item>
+    </style>
+</resources>

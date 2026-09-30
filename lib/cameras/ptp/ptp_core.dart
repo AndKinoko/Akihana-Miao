@@ -1,4 +1,43 @@
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
+
+/// 协议层日志出口。
+///
+/// 之前这里是裸 print，每个事务打 3~4 行，且要逐行 // ignore: avoid_print
+/// 压制 lint。抽成单例后：① 输出等级一处配置；② release 版自动降级
+/// （kReleaseMode 下 debugPrint 本身不输出，print 却是无条件刷 logcat）；
+/// ③ 协议调试信息不再散落成 lint 豁免。
+///
+/// 接日志系统时只改这里的 sink，不用动协议代码。
+class PtpLog {
+  PtpLog._();
+
+  /// 静默：完全丢弃（生产环境可用）
+  static const int levelSilent = 0;
+
+  /// 常规：只记异常与生命周期事件
+  static const int levelInfo = 1;
+
+  /// 详细：逐事务收发（调试相机连接/传输问题）
+  static const int levelDebug = 2;
+
+  /// 当前等级。默认 info：保留连接失败这类关键信息，不刷逐包日志
+  static int level = levelInfo;
+
+  /// 实际输出；置空即静默（测试时可注入收集器）
+  static void Function(String message)? sink = debugPrint;
+
+  static bool get _enabled => level > levelSilent && sink != null;
+
+  static void d(String message) {
+    if (level < levelDebug || !_enabled) return;
+    sink!('PTP/IP: $message');
+  }
+
+  static void i(String message) {
+    if (level < levelInfo || !_enabled) return;
+    sink!(message);
+  }
+}
 
 /// PTP（PIMA 15740）常量与字节编解码工具
 class Ptp {
@@ -192,7 +231,7 @@ class PtpObjectInfo {
     required this.storageId,
     required this.objectFormat,
     required this.size,
-    required this.parentObject,
+    this.parentObject = 0,
     required this.filename,
     this.captureDate,
   });
@@ -200,6 +239,9 @@ class PtpObjectInfo {
   final int storageId;
   final int objectFormat;
   final int size;
+
+  /// 父对象句柄。列表阶段恒为 0（flat 列表，parent=0），不建目录树，
+  /// 故仅在解析时保留原始值供将来建树用，当前无读取方
   final int parentObject;
   final String filename;
   final DateTime? captureDate;

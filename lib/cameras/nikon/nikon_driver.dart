@@ -65,6 +65,11 @@ class PtpCameraSession extends CameraSession {
     return data;
   }
 
+  /// eventPoll 策略的统一入口（尼康 USB 目前用句柄轮询，保留此实现
+  /// 以便策略切换；佳能等 HTTP 后端各自覆盖）
+  @override
+  Future<List<PtpEvent>> pollNewObjects() => getNikonEvents();
+
   /// 流式下载对象；返回收到的总字节数。
   /// 分块不支持时由 PtpSession 自动回退 GetObject。
   @override
@@ -73,11 +78,13 @@ class PtpCameraSession extends CameraSession {
     int size,
     void Function(List<int> chunk) sink, {
     void Function(int received, int total)? onProgress,
+    bool Function()? isCancelled,
   }) async {
     final stream = await _ptp.downloadObject(
       handle,
       size,
       onProgress: (r) => onProgress?.call(r, size),
+      isCancelled: isCancelled,
     );
     var total = 0;
     await for (final chunk in stream) {

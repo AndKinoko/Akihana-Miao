@@ -68,7 +68,8 @@ class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
                             val path = call.argument<String>("path")!!
                             val fileName = call.argument<String>("fileName")!!
                             val subFolder = call.argument<String>("subFolder")
-                            reply(saveToGallery(path, fileName, subFolder))
+                            val forceDownload = call.argument<Boolean>("forceDownload") ?: false
+                            reply(saveToGallery(path, fileName, subFolder, forceDownload))
                         }
                         "queryGallery" -> reply(queryGallery())
                         "startKeepAlive" -> {
@@ -155,9 +156,16 @@ class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
     /**
      * 把本地文件存入系统相册/下载目录（MediaStore，用户可见）。
      * 图片 → Pictures/AkihanaMiao，视频 → Movies/AkihanaMiao，其他(RAW等) → Download/AkihanaMiao。
+     * [forceDownload] 强制走 Download（「不存相册」模式：文件不污染相册时间线，
+     * 但仍在传输页「已拉取」面板可见——该面板只扫这三个专属目录）。
      * 返回 MediaStore uri；失败返回 null。仅支持 API 29+。
      */
-    private fun saveToGallery(srcPath: String, fileName: String, subFolder: String?): String? {
+    private fun saveToGallery(
+        srcPath: String,
+        fileName: String,
+        subFolder: String?,
+        forceDownload: Boolean = false,
+    ): String? {
         if (Build.VERSION.SDK_INT < 29) return null
         val src = java.io.File(srcPath)
         if (!src.exists()) return null
@@ -172,6 +180,10 @@ class UsbHostChannel(private val context: Context, engine: FlutterEngine) {
         // 日期子目录（相册按拍摄日期分文件夹）；仅接受安全的单段目录名
         val datePart = if (subFolder != null && subFolder.matches(Regex("[0-9]{4}-[0-9]{2}-[0-9]{2}"))) "/$subFolder" else ""
         val (collection, relPath) = when {
+            forceDownload -> Pair(
+                android.provider.MediaStore.Downloads.getContentUri(
+                    android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY),
+                "Download/AkihanaMiao$datePart")
             mime.startsWith("image/") -> Pair(
                 android.provider.MediaStore.Images.Media.getContentUri(
                     android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY),

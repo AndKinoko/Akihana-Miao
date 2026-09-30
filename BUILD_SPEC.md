@@ -2,7 +2,8 @@
 
 ## 0. 目标
 Android App：尼康 Z6（一代）拍摄后自动把新图拉到手机，并上传到自建 Rust 网盘
-（F:\RUST\111\pan_for_Photographer_rust，只做客户端，禁止改动网盘项目）。
+（即网盘服务端项目 pan_for_Photographer_rust；本项目只做客户端，
+禁止改动网盘项目）。
 USB 有线连接作为兜底。后续覆盖：佳能、索尼、iOS、鸿蒙。
 
 ## 1. 技术栈与平台策略

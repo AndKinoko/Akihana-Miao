@@ -25,6 +25,32 @@ class PtpException implements Exception {
       code == null ? message : '$message (0x${code!.toRadixString(16)})';
 }
 
+/// 下载被取消钩子中止（相机拔出/会话切换），非链路故障
+class DownloadCancelled implements Exception {
+  const DownloadCancelled([this.message = '下载已取消']);
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// 链路自检：发一个无副作用的轻量事务确认链路活着。
+///
+/// 只在诊断路径使用——空闲保活由 CameraHub 的 25s 定时器负责，
+/// 链路自身不接管超时/重连（PTP 事务一旦超时，响应流会残留并污染组包
+/// 边界，只能整链路作废重来，见 WifiLink._markDead）。
+extension PtpLinkProbe on PtpLink {
+  Future<bool> probe() async {
+    try {
+      await transact(Ptp.opGetStorageIDs, [],
+          timeout: const Duration(seconds: 3));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
 /// PTP 事件（ObjectAdded 0x4002 / ObjectRemoved 0x4003 / CaptureComplete 0x400d 等）
 class PtpEvent {
   const PtpEvent({

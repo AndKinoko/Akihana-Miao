@@ -16,10 +16,16 @@ class NetBinder {
   }
 
   /// 恢复默认路由
-  static Future<void> unbind() async {
+  ///
+  /// 已接进真实调用：上传等走蜂窝的场景必须先解开相机热点的进程级绑定，
+  /// 否则 NetBinder.isOnWifi 与网盘请求都会被 bindProcessToNetwork 限制在
+  /// 相机热点上（「WiFi 环境上传」永远等不到条件满足）
+  static Future<bool> unbind() async {
     try {
-      await _channel.invokeMethod('unbindNetwork');
-    } catch (_) {}
+      return await _channel.invokeMethod<bool>('unbindNetwork') ?? false;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// 当前是否在可上网的 WiFi 环境（相机热点不算）

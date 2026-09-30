@@ -3,8 +3,13 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import '../ptp/ptp_link.dart';
+import '../ptp/ptp_core.dart' show PtpLog;
 
-/// PTP/IP 包类型（组包蓝本：docs/reference/aero_packets.ts，实测代码勿改格式）
+/// PTP/IP 包类型。
+///
+/// 组包蓝本是开源项目 AeroShutter 的 PTP-IP 实现（本地参考副本不入库）。
+/// 下列类型值与编码格式以 PIMA 15740 与该实现的实测结论为准，**勿随意改动**——
+/// 相机对包格式的容错为零。
 class PtpIpPacketType {
   static const initCommandRequest = 1;
   static const initCommandAck = 2;
@@ -65,6 +70,9 @@ class WifiLink implements PtpLink {
   Completer<List<int>>? _pending;
   BytesBuilder? _pendingBody; // 数据阶段累积（零拷贝 append）
   int _pendingTotal = 0;
+  /// 当前在途事务的进度回调：命令通道的 socket 数据回调发生在
+  /// _runTransact 之外，闭包无法直接捕获，故挂在 link 上随事务切换
+  void Function(int received)? _pendingOnData;
   Timer? _timeoutTimer;
 
   final StreamController<PtpEvent> _events = StreamController.broadcast();
@@ -86,18 +94,15 @@ class WifiLink implements PtpLink {
   }) async {
     Socket? cmd;
     Socket? event;
-    // ignore: avoid_print
-    print('PTP/IP: 正在连接 $host:$ptpIpPort …');
+    PtpLog.d('正在连接 $host:$ptpIpPort …');
     try {
       cmd = await Socket.connect(host, ptpIpPort, timeout: timeout);
-      // ignore: avoid_print
-      print('PTP/IP: TCP 命令连接已建立，发送 InitCommandRequest …');
+      PtpLog.d('TCP 命令连接已建立，发送 InitCommandRequest …');
       final link = WifiLink._(cmd, null).._host = host;
       final ack = await link._initCommand(hostName, timeout);
       link.responderName = ack.responderName;
-      // ignore: avoid_print
-      print(
-        'PTP/IP: 握手成功 connNumber=${ack.connectionNumber} 相机=${ack.responderName}',
+      PtpLog.d(
+        '握手成功 connNumber=${ack.connectionNumber} 相机=${ack.responderName}',
       );
 
       // 事件连接（必须先于 OpenSession，避坑 #2）
@@ -108,18 +113,15 @@ class WifiLink implements PtpLink {
         onError: (Object e) => link._markDead('事件连接错误: $e'),
         onDone: () => link._markDead('事件连接被相机关闭'),
       );
-      // ignore: avoid_print
-      print('PTP/IP: 事件连接 TCP 已建立，发送 InitEventRequest …');
+      PtpLog.d('事件连接 TCP 已建立，发送 InitEventRequest …');
       await link._initEvent(ack.connectionNumber, timeout);
-      // ignore: avoid_print
-      print('PTP/IP: 事件连接握手完成，链路就绪');
+      PtpLog.d('事件连接握手完成，链路就绪');
 
       // 命令连接数据流监听在 _initCommand 里已挂上
       return link;
     } on SocketException catch (e) {
-      // ignore: avoid_print
-      print(
-        'PTP/IP: SocketException ${e.osError?.message ?? e.message} (errno=${e.osError?.errorCode})',
+      PtpLog.d(
+        'SocketException ${e.osError?.message ?? e.message} (errno=${e.osError?.errorCode})',
       );
       try {
         cmd?.destroy();
@@ -170,7 +172,7 @@ class WifiLink implements PtpLink {
     );
   }
 
-  // ---------- 组包（格式与 aero_packets.ts 一致） ----------
+  // ---------- 组包（格式与 PIMA 15740 / AeroShutter 实测实现一致） ----------
 
   static Uint8List _packet(int type, List<int> payload) {
     final b = BytesBuilder();
@@ -239,7 +241,7 @@ class WifiLink implements PtpLink {
   void _onCmdData(Uint8List chunk) {
     if (_dead) return;
     _cmdBuf.addAll(chunk);
-    _drain(_cmdBuf, _handleCmdPacket, (rest) => _cmdBuf = rest);
+    _drain(_cmdBuf, (t, p) => _handleCmdPacket(t, p, _pendingOnData), (rest) => _cmdBuf = rest);
   }
 
   void _onEventData(Uint8List chunk) {
@@ -268,7 +270,8 @@ class WifiLink implements PtpLink {
     setRest(buf);
   }
 
-  void _handleCmdPacket(int type, List<int> payload) {
+  /// 命令通道来包回调。onData 透传给数据阶段做进度上报（见 transact 契约）
+  void _handleCmdPacket(int type, List<int> payload, void Function(int)? onData) {
     switch (type) {
       case PtpIpPacketType.initCommandAck:
         final c = _initAck;
@@ -283,8 +286,7 @@ class WifiLink implements PtpLink {
         }
       case PtpIpPacketType.probeRequest:
         // 相机保活探测（WMU 行为，审计报告确认必须回应）
-        // ignore: avoid_print
-        print('PTP/IP: 收到 ProbeRequest，回应 ProbeResponse');
+        PtpLog.d('收到 ProbeRequest，回应 ProbeResponse');
         _cmd?.add(_packet(PtpIpPacketType.probeResponse, const []));
       case PtpIpPacketType.startData:
         // 数据阶段开始：tid u32 + 总长度 u64（数据包在 OperationResponse 之前到达）
@@ -295,8 +297,7 @@ class WifiLink implements PtpLink {
               bd.getUint32(4, Endian.little) +
               bd.getUint32(8, Endian.little) * 0x100000000;
           _pendingBody = BytesBuilder();
-          // ignore: avoid_print
-          print('PTP/IP: 数据阶段开始 total=$_pendingTotal');
+          PtpLog.d('数据阶段开始 total=$_pendingTotal');
         }
       case PtpIpPacketType.data:
       case PtpIpPacketType.endData:
@@ -304,9 +305,11 @@ class WifiLink implements PtpLink {
         final p = _pending;
         if (p != null && payload.length > 4) {
           _pendingBody?.add(payload.sublist(4));
+          // 进度回调：PtpLink 契约要求每收到一块就报已收字节数，
+          // 不回调会让下载进度条全程停在 0%（此前 USB 有、WiFi 没有）
+          onData?.call(_pendingBody?.length ?? 0);
           if (type == PtpIpPacketType.endData) {
-            // ignore: avoid_print
-            print('PTP/IP: 数据阶段结束，共 ${_pendingBody?.length} 字节');
+            PtpLog.d('数据阶段结束，共 ${_pendingBody?.length} 字节');
           }
         }
       case PtpIpPacketType.operationResponse:
@@ -320,9 +323,8 @@ class WifiLink implements PtpLink {
           for (var off = 6; off + 4 <= payload.length; off += 4) {
             params.add(bd.getUint32(off, Endian.little));
           }
-          // ignore: avoid_print
-          print(
-            'PTP/IP: 事务响应 code=0x${respCode.toRadixString(16)} '
+          PtpLog.d(
+            '事务响应 code=0x${respCode.toRadixString(16)} '
             'params=$params',
           );
           if (respCode != 0x2001) {
@@ -332,10 +334,10 @@ class WifiLink implements PtpLink {
           }
           _pending = null;
           _pendingBody = null;
+          _pendingOnData = null;
         }
       default:
-        // ignore: avoid_print
-        print('PTP/IP: 未处理的命令通道包 type=$type len=${payload.length}');
+        PtpLog.d('未处理的命令通道包 type=$type len=${payload.length}');
     }
   }
 
@@ -421,7 +423,8 @@ class WifiLink implements PtpLink {
     void Function(int received)? onData,
   }) {
     // 串行化：同一命令连接严格单事务在途（与 AeroShutter 一致）
-    Future<List<int>> run() => _runTransact(code, params, sendData, timeout);
+    Future<List<int>> run() =>
+        _runTransact(code, params, sendData, timeout, onData);
     final result = _queue.then((_) => run(), onError: (_) => run());
     _queue = result.then((_) {}, onError: (_) {});
     return result;
@@ -432,6 +435,7 @@ class WifiLink implements PtpLink {
     List<int> params,
     List<int> sendData,
     Duration timeout,
+    void Function(int received)? onData,
   ) async {
     if (_dead || _cmd == null) throw const PtpException('PTP/IP 连接已断开');
     final tid = ++_tid;
@@ -439,10 +443,12 @@ class WifiLink implements PtpLink {
     _pending = c;
     _pendingBody = BytesBuilder();
     _pendingTotal = 0;
+    _pendingOnData = onData;
     _timeoutTimer = Timer(timeout, () {
       if (_pending == c) {
         _pending = null;
         _pendingBody = null;
+        _pendingOnData = null;
         if (!c.isCompleted) {
           c.completeError(
             PtpException('操作 0x${code.toRadixString(16)} 超时（$_host）'),
@@ -454,9 +460,8 @@ class WifiLink implements PtpLink {
       }
     });
     try {
-      // ignore: avoid_print
-      print(
-        'PTP/IP: 发送事务 0x${code.toRadixString(16)} tid=$tid '
+      PtpLog.d(
+        '发送事务 0x${code.toRadixString(16)} tid=$tid '
         'params=$params dataPhase=${sendData.isEmpty ? 1 : 3}',
       );
       _cmd!.add(

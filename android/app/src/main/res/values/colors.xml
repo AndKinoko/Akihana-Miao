@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 冷启动底色。与图标同族的深色（见 docs/brand/icon），
+         App 默认深色主题，用深色启动避免白屏闪烁。 -->
+    <color name="splash_background">#FF0A0E15</color>
+</resources>

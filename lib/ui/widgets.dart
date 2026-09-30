@@ -581,7 +581,9 @@ class EmptyState extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    return Padding(
+    // 小高度/横屏下（如测试窗口 800x600）可用高度可能小于内容高度，
+    // 用滚动容器兜底，避免 RenderFlex overflow
+    return SingleChildScrollView(
       padding: padding,
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,

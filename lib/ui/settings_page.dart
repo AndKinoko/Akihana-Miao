@@ -19,6 +19,15 @@ class _SettingsPageState extends State<SettingsPage> {
   Widget build(BuildContext context) {
     final cfg = AppConfig.instance;
     final cs = Theme.of(context).colorScheme;
+    // 配置变更会 notify（AppConfig extends ChangeNotifier），
+    // 登录状态随之变化也能立刻反映到「已登录/未登录」标记
+    return ListenableBuilder(
+      listenable: cfg,
+      builder: (context, _) => _body(cfg, cs),
+    );
+  }
+
+  Widget _body(AppConfig cfg, ColorScheme cs) {
     final modeText = switch (cfg.uploadMode) {
       AppConfig.modeLocalOnly => '保存到本地',
       AppConfig.modeWifi => 'WiFi 环境上传',
@@ -39,7 +48,7 @@ class _SettingsPageState extends State<SettingsPage> {
               trailing: IosSwitch(
                 value: cfg.autoPull,
                 onChanged: (v) async {
-                  setState(() => AppConfig.instance.autoPull = v);
+                  cfg.autoPull = v;
                   await AppConfig.instance.save();
                 },
               ),
@@ -51,7 +60,7 @@ class _SettingsPageState extends State<SettingsPage> {
               trailing: IosSwitch(
                 value: cfg.backgroundRun,
                 onChanged: (v) async {
-                  setState(() => AppConfig.instance.backgroundRun = v);
+                  cfg.backgroundRun = v;
                   await AppConfig.instance.save();
                   KeepAliveSync.onSettingChanged();
                 },
@@ -178,7 +187,7 @@ class UploadStrategyPage extends StatefulWidget {
 
 class _UploadStrategyPageState extends State<UploadStrategyPage> {
   Future<void> _setMode(int mode) async {
-    setState(() => AppConfig.instance.uploadMode = mode);
+    AppConfig.instance.uploadMode = mode;
     await AppConfig.instance.save();
     UploadQueue.instance.kick();
   }
@@ -245,6 +254,8 @@ class _PullStrategyPageState extends State<PullStrategyPage> {
               for (final t in const [
                 ('JPEG', '约 10 MB/张'),
                 ('NEF（RAW）', '约 25 MB/张'),
+                ('CR3（RAW）', '佳能 RAW'),
+                ('CR2（RAW）', '佳能旧款 RAW'),
                 ('MOV', '视频'),
                 ('MP4', '视频'),
               ])
@@ -260,11 +271,11 @@ class _PullStrategyPageState extends State<PullStrategyPage> {
                     final key = t.$1.contains('（')
                         ? t.$1.substring(0, t.$1.indexOf('（'))
                         : t.$1;
-                    setState(() {
-                      cfg.pullTypes.contains(key)
-                          ? cfg.pullTypes.remove(key)
-                          : cfg.pullTypes.add(key);
-                    });
+                    // 必须换新实例：setter 靠 setEquals 判定是否变化，
+                    // 原地 add/remove 同一个 Set 不会触发任何通知
+                    final next = Set<String>.of(cfg.pullTypes);
+                    next.contains(key) ? next.remove(key) : next.add(key);
+                    cfg.pullTypes = next;
                     await AppConfig.instance.save();
                   },
                 ),
@@ -279,7 +290,7 @@ class _PullStrategyPageState extends State<PullStrategyPage> {
                 trailing: IosSwitch(
                   value: cfg.chargeOnly,
                   onChanged: (v) async {
-                    setState(() => AppConfig.instance.chargeOnly = v);
+                    cfg.chargeOnly = v;
                     await AppConfig.instance.save();
                     UploadQueue.instance.kick();
                   },
@@ -291,7 +302,7 @@ class _PullStrategyPageState extends State<PullStrategyPage> {
                 trailing: IosSwitch(
                   value: cfg.lowBatteryPause,
                   onChanged: (v) async {
-                    setState(() => AppConfig.instance.lowBatteryPause = v);
+                    cfg.lowBatteryPause = v;
                     await AppConfig.instance.save();
                     UploadQueue.instance.kick();
                   },
@@ -350,7 +361,7 @@ class _AlbumStoragePageState extends State<AlbumStoragePage> {
                 trailing: IosSwitch(
                   value: cfg.dateFolders,
                   onChanged: (v) async {
-                    setState(() => AppConfig.instance.dateFolders = v);
+                    cfg.dateFolders = v;
                     await AppConfig.instance.save();
                   },
                 ),
@@ -397,7 +408,7 @@ class _AlbumStoragePageState extends State<AlbumStoragePage> {
                       );
                       if (ok != true) return;
                     }
-                    setState(() => AppConfig.instance.deleteAfterUpload = v);
+                    cfg.deleteAfterUpload = v;
                     await AppConfig.instance.save();
                   },
                 ),
@@ -408,7 +419,7 @@ class _AlbumStoragePageState extends State<AlbumStoragePage> {
                 trailing: IosSwitch(
                   value: cfg.saveToGallery,
                   onChanged: (v) async {
-                    setState(() => AppConfig.instance.saveToGallery = v);
+                    cfg.saveToGallery = v;
                     await AppConfig.instance.save();
                   },
                 ),

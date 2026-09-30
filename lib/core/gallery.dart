@@ -7,16 +7,20 @@ class Gallery {
 
   /// 保存成功返回 true；失败/不支持返回 false（不抛异常，由调用方决定提示）。
   /// [subFolder] 可选子目录（如 yyyy-MM-dd），加在 AkihanaMiao 之后。
+  /// [forceDownload] 为 true 时忽略类型，一律存 Download/AkihanaMiao——
+  /// 用于「不存相册」模式：文件不进相册时间线，但仍在「已拉取」面板可见。
   static Future<bool> save(
     String filePath,
     String fileName, {
     String? subFolder,
+    bool forceDownload = false,
   }) async {
     try {
       final uri = await _channel.invokeMethod<String>('saveToGallery', {
         'path': filePath,
         'fileName': fileName,
         'subFolder': subFolder,
+        'forceDownload': forceDownload,
       });
       return uri != null;
     } catch (_) {
