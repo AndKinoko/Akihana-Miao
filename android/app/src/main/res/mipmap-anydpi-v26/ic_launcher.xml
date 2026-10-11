@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 自适应图标（API 26+）。由 docs/brand/icon/generate_icons.py 生成，勿手改。 -->
+<!-- 自适应图标（API 26+）。由 docs/brand/icon/generate_icons_from_icon_jpg.py
+     从 icon.jpg 生成，勿手改。本项目 minSdk=29，全设备都走这条。 -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@mipmap/ic_launcher_background"/>
     <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
